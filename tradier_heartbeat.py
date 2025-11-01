@@ -19,11 +19,15 @@ import subprocess
 
 load_dotenv()
 
+
+# keep system awake while this Python script runs
+caffeinate = subprocess.Popen(["caffeinate", "-dims"])
+
 # === CONFIG ===
 TRADIER_ACCESS_TOKEN = os.getenv("TRADIER_ACCESS_TOKEN")
 ACCOUNT_ID           = os.getenv("TRADIER_ACCOUNT_ID")
 BASE_URL             = os.getenv("TRADIER_BASE_URL", "https://api.tradier.com/v1").rstrip("/")
-HEARTBEAT_SYMBOL     = os.getenv("HEARTBEAT_SYMBOL", "SPXW").upper()  # underlying for quote/chain and for preview 'symbol'
+HEARTBEAT_SYMBOL     = os.getenv("HEARTBEAT_SYMBOL", "SPX").upper()  # underlying for quote/chain and for preview 'symbol'
 ORDER_QTY            = int(os.getenv("ORDER_QTY", "1"))
 
 SMTP_HOST  = os.getenv("SMTP_HOST")
@@ -42,7 +46,7 @@ MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "2000"))
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def set_mac_volume(volume_level):
+def alert_with_vol(volume_level):
     """
     Sets the main output volume of the Mac.
     volume_level should be an integer between 0 (mute) and 100 (max volume).
@@ -52,6 +56,9 @@ def set_mac_volume(volume_level):
 
     # Execute the AppleScript command using osascript
     subprocess.run(["osascript", "-e", "set volume output muted false", "-e", f"set volume output volume {volume_level}"], check=True)
+    print("🔈Alert sound played on mac")
+    playsound("alarm2.wav")
+
 
 
 
@@ -65,7 +72,7 @@ def _print_response(tag, url, status_code, elapsed, content, is_json_guess=True)
         body = body[:MAX_PRINT_CHARS] + "\n…(truncated)…"
     print(f"[{now()}] 🔎 {tag}\nURL: {url}\nStatus: {status_code} | Elapsed: {elapsed:.2f}s\nBody:\n{body}\n")
 
-def send_email(subject, body):
+def send_alert(subject, body):
     if not (SMTP_HOST and SMTP_PORT and EMAIL_FROM and EMAIL_TO):
         print(f"[{now()}] ⚠️ Email not sent (SMTP vars missing)\n{body}")
         return
@@ -80,6 +87,8 @@ def send_email(subject, body):
         print(f"[{now()}] 📧 Alert email sent.")
     except Exception as e:
         print(f"[{now()}] ❌ Email send failed: {e}")
+    
+    alert_with_vol(50)
 
 def timed_req(method, url, data=None, tag="API"):
     t0 = time.monotonic()
@@ -117,7 +126,7 @@ def timed_req(method, url, data=None, tag="API"):
 def get_positions():      return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/positions", tag="Positions")
 def get_orders():         return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders", tag="Orders")
 def get_quote(sym):       return timed_req("get", f"{BASE_URL}/markets/quotes?symbols={sym}", tag=f"Quote {sym}")
-def get_expirations(sym): return timed_req("get", f"{BASE_URL}/markets/options/expirations?symbol={sym}", tag=f"Expirations {sym}")
+def get_expirations(sym): return timed_req("get", f"{BASE_URL}/markets/options/expirations?symbol={sym}&includeAllRoots=true", tag=f"Expirations {sym}")
 def get_chain(sym, exp):  return timed_req("get", f"{BASE_URL}/markets/options/chains?symbol={sym}&expiration={exp}", tag=f"Chain {sym} {exp}")
 
 def get_option_quotes(symbols):
@@ -312,26 +321,19 @@ def run_checks():
     c3, _ = check_preview_single_put(); errs+=c3
     if errs:
         print("\n".join(f"❌ {e}" for e in errs))
-        send_email(f"[Automation Alert] Tradier Heartbeat Failures ({len(errs)}) @ {now()}", "\n".join(errs))
-        # playsound
-        set_mac_volume(50) # Set volume to 100%
-        playsound("alarm2.wav")
-        print("🔈 Alert sound played on mac")
+        send_alert(f"[Automation Alert] Tradier Heartbeat Failures ({len(errs)}) @ {now()}", "\n".join(errs))
 
     else:
         print("✅ All 3 checks passed successfully.\n")
 
 def main():
-    # playsound
-    set_mac_volume(50) # Set volume to 100%
-    playsound("alarm2.wav")
-    print("🔈 (TEST) Alert sound played on mac")
+    send_alert("[Automation Alert] TEST Alert MAC", "")
     while True:
         try:
             run_checks()
         except Exception as e:
             tb=traceback.format_exc()
-            send_email("[ALERT] Heartbeat Script Crash", f"{e}\n{tb}")
+            send_alert("[ALERT] Heartbeat Script Crash", f"{e}\n{tb}")
             print(tb)
         time.sleep(60)
 
