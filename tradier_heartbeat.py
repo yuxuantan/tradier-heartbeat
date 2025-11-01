@@ -14,13 +14,16 @@ import os, time, json, smtplib, traceback, requests
 from datetime import datetime, date
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
+from playsound import playsound
+import subprocess
+
 load_dotenv()
 
 # === CONFIG ===
 TRADIER_ACCESS_TOKEN = os.getenv("TRADIER_ACCESS_TOKEN")
 ACCOUNT_ID           = os.getenv("TRADIER_ACCOUNT_ID")
 BASE_URL             = os.getenv("TRADIER_BASE_URL", "https://api.tradier.com/v1").rstrip("/")
-HEARTBEAT_SYMBOL     = os.getenv("HEARTBEAT_SYMBOL", "SPX").upper()  # underlying for quote/chain and for preview 'symbol'
+HEARTBEAT_SYMBOL     = os.getenv("HEARTBEAT_SYMBOL", "SPXW").upper()  # underlying for quote/chain and for preview 'symbol'
 ORDER_QTY            = int(os.getenv("ORDER_QTY", "1"))
 
 SMTP_HOST  = os.getenv("SMTP_HOST")
@@ -38,6 +41,19 @@ SLA_SECS    = 10
 MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "2000"))
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def set_mac_volume(volume_level):
+    """
+    Sets the main output volume of the Mac.
+    volume_level should be an integer between 0 (mute) and 100 (max volume).
+    """
+    if not 0 <= volume_level <= 100:
+        raise ValueError("Volume level must be between 0 and 100.")
+
+    # Execute the AppleScript command using osascript
+    subprocess.run(["osascript", "-e", "set volume output muted false", "-e", f"set volume output volume {volume_level}"], check=True)
+
+
 
 def _pretty(obj):
     try: return json.dumps(obj, indent=2, sort_keys=True)
@@ -297,10 +313,19 @@ def run_checks():
     if errs:
         print("\n".join(f"❌ {e}" for e in errs))
         send_email(f"[Automation Alert] Tradier Heartbeat Failures ({len(errs)}) @ {now()}", "\n".join(errs))
+        # playsound
+        set_mac_volume(50) # Set volume to 100%
+        playsound("alarm2.wav")
+        print("🔈 Alert sound played on mac")
+
     else:
         print("✅ All 3 checks passed successfully.\n")
 
 def main():
+    # playsound
+    set_mac_volume(50) # Set volume to 100%
+    playsound("alarm2.wav")
+    print("🔈 (TEST) Alert sound played on mac")
     while True:
         try:
             run_checks()
