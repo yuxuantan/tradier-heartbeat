@@ -9,9 +9,8 @@ Runs every minute (kept awake via `caffeinate`) and performs 4 checks:
 4) Balance drawdown guard: today's total equity vs. yesterday's (from historical-balances or local store);
    if drop > BALANCE_DD_LIMIT_PCT (default 3%), fail & alert.
 
-Notes
-- Prints raw responses for every API call (trimmed to MAX_PRINT_CHARS).
-- Handles Tradier's array/object flip in JSON (see docs' Response Format note).
+Enhancement:
+- Per-request immediate retries: each HTTP call retries up to N times (default 3) only on true timeouts.
 """
 
 import os, time, json, smtplib, traceback, requests, atexit, subprocess
@@ -47,12 +46,13 @@ EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_TO   = os.getenv("EMAIL_TO")
 
 # HTTP
-HEADERS     = {"Authorization": f"Bearer {TRADIER_ACCESS_TOKEN}", "Accept": "application/json"}
-REQ_TIMEOUT = 8
-SLA_SECS    = 10
+HEADERS      = {"Authorization": f"Bearer {TRADIER_ACCESS_TOKEN}", "Accept": "application/json"}
+REQ_TIMEOUT  = 10               # per request timeout seconds
+SLA_SECS     = 10
+MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))  # immediate retries per request on timeout only
 
 # Logging
-MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "2000"))
+MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "1000"))
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def today_str(): return date.today().isoformat()
@@ -83,20 +83,22 @@ def send_alert(subject, body):
             print(f"[{now()}] 📧 Alert email sent.")
         except Exception as e:
             print(f"[{now()}] ❌ Email send failed: {e}")
-    alert_with_vol(60)
+    alert_with_vol(80)
 
 # === Utilities ===
 def _pretty(obj):
     try: return json.dumps(obj, indent=2, sort_keys=True)
     except Exception: return str(obj)
 
-def _print_response(tag, url, status_code, elapsed, content, is_json_guess=True):
+def _print_response(tag, url, status_code, elapsed, content, is_json_guess=True, attempt=None):
     body = _pretty(content) if is_json_guess else str(content)
     if len(body) > MAX_PRINT_CHARS:
         body = body[:MAX_PRINT_CHARS] + "\n…(truncated)…"
-    print(f"[{now()}] 🔎 {tag}\nURL: {url}\nStatus: {status_code} | Elapsed: {elapsed:.2f}s\nBody:\n{body}\n")
+    att = f" (attempt {attempt})" if attempt is not None else ""
+    print(f"[{now()}] 🔎 {tag}{att}\nURL: {url}\nStatus: {status_code} | Elapsed: {elapsed:.2f}s\nBody:\n{body}\n")
 
-def timed_req(method, url, data=None, tag="API"):
+def _do_http(method, url, data=None, tag="API", attempt=None):
+    """One attempt only. Returns (ok, elapsed, content, status_code, err_tag)."""
     t0 = time.monotonic()
     try:
         if method == "get":
@@ -120,13 +122,37 @@ def timed_req(method, url, data=None, tag="API"):
             except Exception:
                 content = r.text
 
-        _print_response(tag, url, r.status_code, elapsed, content, is_json_guess=is_json)
+        _print_response(tag, url, r.status_code, elapsed, content, is_json_guess=is_json, attempt=attempt)
         ok = r.ok and elapsed <= SLA_SECS
-        return ok, elapsed, content, r.status_code, None if ok else f"HTTP {r.status_code}"
+        return ok, elapsed, content, r.status_code, (None if ok else f"HTTP {r.status_code}")
+    except requests.exceptions.Timeout:
+        elapsed = time.monotonic() - t0
+        print(f"[{now()}] ⏱️ Timeout in {tag} after {elapsed:.2f}s (attempt {attempt})")
+        return False, elapsed, None, None, "timeout"
     except Exception as e:
         elapsed = time.monotonic() - t0
-        print(f"[{now()}] ❌ {tag} request error: {e} (elapsed {elapsed:.2f}s)")
+        print(f"[{now()}] ❌ {tag} request error: {e} (elapsed {elapsed:.2f}s) (attempt {attempt})")
         return False, elapsed, None, None, str(e)
+
+def timed_req(method, url, data=None, tag="API", retries=MAX_RETRIES):
+    """
+    Immediate retries (no backoff) for *timeout* errors only.
+    Returns final (ok, elapsed_last, content_last, status_code_last, err_tag_last).
+    """
+    last_result = (False, 0.0, None, None, "timeout")
+    for attempt in range(1, retries + 1):
+        ok, elapsed, content, status_code, err = _do_http(method, url, data=data, tag=tag, attempt=attempt)
+        last_result = (ok, elapsed, content, status_code, err)
+        if ok:
+            return last_result
+        if err != "timeout":
+            # Non-timeout error -> stop immediately
+            return last_result
+        if attempt < retries:
+            # Immediate retry (optionally: short sleep like time.sleep(0.25))
+            continue
+    # exhausted retries (all timeouts or final result non-ok)
+    return last_result
 
 # === API wrappers ===
 def get_positions():      return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/positions", tag="Positions")
@@ -140,9 +166,9 @@ def get_option_quotes(symbols):
     return timed_req("get", url, tag=f"Option Quotes ({symbols})")
 
 # Balances endpoints (current + historical)
-def get_balances_now():   # current balances
+def get_balances_now():
     return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/balances", tag="Balances Now")
-def get_historical_balances():  # daily historical balances (if enabled for your account)
+def get_historical_balances():
     return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/historical-balances?period=WEEK", tag="Historical Balances")
 
 def preview_single_option(underlying_symbol, option_symbol, side, qty, limit_price):
@@ -253,11 +279,26 @@ def write_balance_store(store):
     except Exception as e:
         print(f"[{now()}] ⚠️ Could not write balance store: {e}")
 
+def _load_and_update_local_balance_store(today_equity):
+    store = read_balance_store()
+    today = today_str()
+    if today_equity is not None:
+        store[today] = today_equity
+        write_balance_store(store)
+    prior_dates = [d for d in store.keys() if d < today]
+    prior_dates.sort()
+    return (store.get(prior_dates[-1]) if prior_dates else None)
+
 # === Checks ===
 def check_positions():
     ok, t, js, status, err = get_positions()
-    if not ok or not isinstance(js, dict):
+    if not ok:
+        if err == "timeout":
+            return [f"Check 1/4 FAILED - positions API timeout x{MAX_RETRIES}"], None
         return [f"Check 1/4 FAILED - positions API error ({err}), {t:.2f}s"], None
+
+    if not isinstance(js, dict):
+        return [f"Check 1/4 FAILED - positions bad payload"], js
     items = safe_get(js, "positions", "position", default=[])
     if isinstance(items, dict): items=[items]
     n = len(items)
@@ -268,8 +309,13 @@ def check_positions():
 
 def check_orders():
     ok, t, js, status, err = get_orders()
-    if not ok or not isinstance(js, dict):
+    if not ok:
+        if err == "timeout":
+            return [f"Check 2/4 FAILED - orders API timeout x{MAX_RETRIES}"]
         return [f"Check 2/4 FAILED - orders API error ({err}), {t:.2f}s"]
+
+    if not isinstance(js, dict):
+        return [f"Check 2/4 FAILED - orders bad payload"]
     n_total, n_active = count_active_orders(js)
     if n_active >= 1 and t <= SLA_SECS:
         print(f"✅ Check 2/4 passed - detected {n_active} active order(s) (total returned {n_total}). Response {t:.2f}s.")
@@ -277,10 +323,14 @@ def check_orders():
     return [f"Check 2/4 FAILED - zero active orders (active={n_active}, total={n_total}) or slow (> {SLA_SECS}s, {t:.2f}s)"]
 
 def check_preview_single_put():
-    # Underlying price
+    # Quote
     ok, tq, q, _, err = get_quote(HEARTBEAT_SYMBOL)
-    if not ok or not isinstance(q, dict):
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - quote timeout x{MAX_RETRIES}"], 0
         return [f"Check 3/4 FAILED - quote error {err or 'bad payload'}"], 0
+    if not isinstance(q, dict):
+        return [f"Check 3/4 FAILED - quote bad payload"], 0
     qobj = safe_get(q, "quotes", "quote")
     if isinstance(qobj, list): qobj = qobj[0] if qobj else {}
     try:
@@ -289,21 +339,36 @@ def check_preview_single_put():
     if under_px <= 0:
         return [f"Check 3/4 FAILED - could not derive underlying price"], 0
 
-    # Expiration (today preferred)
+    # Expiration
+    ok, te, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - expirations timeout x{MAX_RETRIES}"], 0
+        return [f"Check 3/4 FAILED - expirations error {err or 'bad payload'}"], 0
+    if not isinstance(exps, dict):
+        return [f"Check 3/4 FAILED - expirations bad payload"], 0
+    raw = safe_get(exps, "expirations", "date", default=[])
+    if isinstance(raw, str): raw=[raw]
+    if not raw:
+        return [f"Check 3/4 FAILED - no expirations available"], 0
     prefer = date.today().isoformat()
-    exp, exp_err = nearest_valid_expiration(HEARTBEAT_SYMBOL, prefer=prefer)
-    if not exp:
-        return [f"Check 3/4 FAILED - {exp_err}"], 0
+    exp = prefer if prefer in raw else (sorted([d for d in raw if d >= prefer])[0] if any(d >= prefer for d in raw) else sorted(raw)[-1])
 
-    # Chain -> ATM put
+    # Chain
     ok, tc, chain, _, err = get_chain(HEARTBEAT_SYMBOL, exp)
-    if not ok or not isinstance(chain, dict):
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - chain timeout x{MAX_RETRIES}"], 0
         return [f"Check 3/4 FAILED - chain error {err or 'bad payload'} for {exp}"], 0
+    if not isinstance(chain, dict):
+        return [f"Check 3/4 FAILED - chain bad payload for {exp}"], 0
+
+    # ATM put
     opt_sym, pick_err = pick_atm_put_symbol(chain, under_px)
     if not opt_sym:
         return [f"Check 3/4 FAILED - {pick_err or 'ATM put selection error'} for {exp}"], 0
 
-    # Mid price
+    # Mid for the put
     mid, details = compute_option_mid(opt_sym)
     if mid is None:
         return [f"Check 3/4 FAILED - cannot compute mid price ({details})"], 0
@@ -320,8 +385,12 @@ def check_preview_single_put():
         qty=ORDER_QTY,
         limit_price=mid
     )
-    if not ok or not isinstance(pv, dict):
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - preview timeout x{MAX_RETRIES}"], 0
         return [f"Check 3/4 FAILED - preview error {err or 'bad payload'}, {tp:.2f}s"], 0
+    if not isinstance(pv, dict):
+        return [f"Check 3/4 FAILED - preview bad payload"], 0
     status_txt = str(safe_get(pv, "order", "status", default="ok")).lower()
     if "ok" in status_txt:
         print(f"✅ Check 3/4 passed - single-leg ATM PUT preview OK for {exp}. Response {tp:.2f}s.")
@@ -329,11 +398,8 @@ def check_preview_single_put():
     return [f"Check 3/4 FAILED - preview status='{status_txt}' for {exp}, {tp:.2f}s"], tp
 
 def _extract_total_equity_from_balances_now(js):
-    # Based on Tradier's balances response (e.g., "balances": {"total_equity": ...})
-    # See: /v1/accounts/{account_id}/balances docs. 
     total_equity = safe_get(js, "balances", "total_equity")
     if total_equity is None:
-        # Some accounts might expose "equity" or "account_equity"
         total_equity = safe_get(js, "balances", "equity")
     try:
         return float(total_equity) if total_equity is not None else None
@@ -342,17 +408,16 @@ def _extract_total_equity_from_balances_now(js):
 
 def _extract_series_from_historical(js):
     """
-    Expected shape (best effort):
+    Best-effort shape:
     {
       "historical_balances": {
-        "balance": [
-          {"date": "2025-10-30", "value": 12345.67, ...},
-          {"date": "2025-10-31", "value": 12444.10, ...},
-          ...
-        ]
+        "balances": {
+          "balance": [
+            {"date": "YYYY-MM-DD", "value": 12345.67, ...}, ...
+          ]
+        }
       }
     }
-    Handles array/object flip as well.
     """
     root = safe_get(js, "historical_balances", "balances")
     if not isinstance(root, dict):
@@ -365,72 +430,76 @@ def _extract_series_from_historical(js):
         try:
             d = str(row.get("date"))
             te = row.get("value")
-            
             te = float(te) if te is not None else None
             if d and te is not None:
                 out.append({"date": d, "total_equity": te})
         except Exception:
             continue
-    # sort ascending by date
     out.sort(key=lambda x: x["date"])
     return out
+
+def read_balance_store():
+    try:
+        with open(BALANCE_STORE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def write_balance_store(store):
+    try:
+        with open(BALANCE_STORE, "w") as f:
+            json.dump(store, f, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"[{now()}] ⚠️ Could not write balance store: {e}")
 
 def _load_and_update_local_balance_store(today_equity):
     store = read_balance_store()
     today = today_str()
-    # save today's equity
     if today_equity is not None:
         store[today] = today_equity
         write_balance_store(store)
-    # Find most recent prior day with equity
     prior_dates = [d for d in store.keys() if d < today]
     prior_dates.sort()
     return (store.get(prior_dates[-1]) if prior_dates else None)
 
 def check_balance_drawdown():
-    errs = []
-
-    # 1) Get current balances
+    # Current balances
     ok_now, t_now, js_now, _, err_now = get_balances_now()
-    if not ok_now or not isinstance(js_now, dict):
+    if not ok_now:
+        if err_now == "timeout":
+            return [f"Check 4/4 FAILED - balances now timeout x{MAX_RETRIES}"]
         return [f"Check 4/4 FAILED - balances API error ({err_now}), {t_now:.2f}s"]
-
+    if not isinstance(js_now, dict):
+        return [f"Check 4/4 FAILED - balances now bad payload"]
     today_equity = _extract_total_equity_from_balances_now(js_now)
     if today_equity is None:
         return [f"Check 4/4 FAILED - could not parse today's total equity from balances payload"]
 
-    # 2) Try historical balances from API
-    ok_hist, t_hist, js_hist, code_hist, err_hist = get_historical_balances()
+    # Historical balances (optional; fallback to local store)
+    ok_hist, t_hist, js_hist, _, err_hist = get_historical_balances()
+    prev = None
     if ok_hist and isinstance(js_hist, dict):
         series = _extract_series_from_historical(js_hist)
-        # pick the most recent date prior to today (data updated nightly)
-        prev = None
         if series:
-            # Get last record that is strictly < today
             prior = [r for r in series if r["date"] < today_str()]
             if prior:
                 prev = prior[-1]["total_equity"]
-        if prev is not None:
-            drop_pct = (prev - today_equity) / prev * 100.0
-            if drop_pct > BALANCE_DD_LIMIT_PCT:
-                return [f"Check 4/4 FAILED - equity drop {drop_pct:.2f}% exceeds {BALANCE_DD_LIMIT_PCT:.2f}% (prev={prev:.2f}, today={today_equity:.2f})"]
-            print(f"✅ Check 4/4 passed - equity drop {drop_pct:.2f}% within limit (prev={prev:.2f}, today={today_equity:.2f}).")
-            # also update local store for redundancy
-            _load_and_update_local_balance_store(today_equity)
-            return []
-        # If historical exists but no prior day yet, fall back to local store below
+    elif err_hist == "timeout":
+        print(f"[{now()}] ⚠️ Historical balances timeout x{MAX_RETRIES}; using local store fallback")
     else:
-        print(f"[{now()}] ⚠️ Historical balances API unavailable; falling back to local store.")
+        print(f"[{now()}] ⚠️ Historical balances API unavailable; using local store fallback")
 
-    # 3) Fallback to local store
-    prev_local = _load_and_update_local_balance_store(today_equity)
-    if prev_local is None:
-        print(f"ℹ️ Check 4/4 fallback - no prior balance available yet; stored today's value for future comparisons.")
-        return []
-    drop_pct = (prev_local - today_equity) / prev_local * 100.0
+    if prev is None:
+        prev = _load_and_update_local_balance_store(today_equity)
+        if prev is None:
+            print(f"ℹ️ Check 4/4 fallback - no prior balance available yet; stored today's value for future comparisons.")
+            return []
+
+    drop_pct = (prev - today_equity) / prev * 100.0
     if drop_pct > BALANCE_DD_LIMIT_PCT:
-        return [f"Check 4/4 FAILED - equity drop {drop_pct:.2f}% exceeds {BALANCE_DD_LIMIT_PCT:.2f}% (prev={prev_local:.2f}, today={today_equity:.2f}) [local]"]
-    print(f"✅ Check 4/4 passed (local) - equity drop {drop_pct:.2f}% within limit (prev={prev_local:.2f}, today={today_equity:.2f}).")
+        return [f"Check 4/4 FAILED - equity drop {drop_pct:.2f}% exceeds {BALANCE_DD_LIMIT_PCT:.2f}% (prev={prev:.2f}, today={today_equity:.2f})"]
+    print(f"✅ Check 4/4 passed - equity drop {drop_pct:.2f}% within limit (prev={prev:.2f}, today={today_equity:.2f}).")
+    _load_and_update_local_balance_store(today_equity)
     return []
 
 # === Orchestration ===
@@ -440,7 +509,7 @@ def run_checks():
     c1, _ = check_positions();           errs+=c1
     errs   += check_orders()
     c3, _ = check_preview_single_put();  errs+=c3
-    errs   += check_balance_drawdown()   # new Check 4
+    errs   += check_balance_drawdown()
 
     if errs:
         print("\n".join(f"❌ {e}" for e in errs))
@@ -449,15 +518,14 @@ def run_checks():
         print("✅ All 4 checks passed successfully.\n")
 
 def main():
-    # test alert hook once at start (optional: comment out)
-    send_alert("[Automation Alert] TEST Alert MAC", "")
-
+    # Optional: initial test alert
+    # send_alert("[Automation Alert] TEST Alert MAC", "")
     while True:
         try:
             run_checks()
         except Exception as e:
             tb=traceback.format_exc()
-            send_alert("[ALERT] Heartbeat Script Crash", f"{e}\n{tb}")
+            send_alert("[Automation Alert] Heartbeat Script Crash", f"{e}\n{tb}")
             print(tb)
         time.sleep(60)
 
