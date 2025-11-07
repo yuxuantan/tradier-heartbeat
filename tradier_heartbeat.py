@@ -519,7 +519,7 @@ def run_checks():
 
 def main():
     # Optional: initial test alert
-    # send_alert("[Automation Alert] TEST Alert MAC", "")
+    send_alert("[Automation Alert] TEST Alert MAC", "")
     while True:
         try:
             run_checks()
