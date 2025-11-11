@@ -64,6 +64,7 @@ def alert_with_vol(volume_level: int):
                                "-e", f"set volume output volume {volume_level}"], check=True)
     print("🔈 Alert sound played on Mac")
     try:
+        playsound("alarm-bell-47839")
         playsound("alarm2.wav")
     except Exception as e:
         print(f"[{now()}] ⚠️ Could not play sound: {e}")
@@ -83,7 +84,7 @@ def send_alert(subject, body):
             print(f"[{now()}] 📧 Alert email sent.")
         except Exception as e:
             print(f"[{now()}] ❌ Email send failed: {e}")
-    alert_with_vol(80)
+    alert_with_vol(50)
 
 # === Utilities ===
 def _pretty(obj):
