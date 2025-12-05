@@ -2,8 +2,9 @@
 
     on:
       schedule:
-        # Runs every day at 00:00 UTC
-        - cron: '0 0 * * *'
+        # Runs at 2:30 PM UTC every weekday (Monday through Friday)
+        # This corresponds to 9:30 AM EST
+        - cron: '30 14 * * 1-5' 
       # Allows manual triggering of the workflow
       workflow_dispatch:
 
@@ -23,7 +24,7 @@
           - name: Install dependencies
             run: pip install -r requirements.txt # Only if you have a requirements.txt
 
-          - name: Run Python script
+          - name: Run heartbeat script
             run: python tradier_heartbeat_nosound.py # Replace main.py with your script's name
             env: 
               PYTHONUNBUFFERED: true
