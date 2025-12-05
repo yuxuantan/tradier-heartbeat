@@ -10,6 +10,7 @@
     jobs:
       run_script:
         runs-on: ubuntu-latest
+        environment: env1
         steps:
           - name: Checkout repository
             uses: actions/checkout@v4
@@ -24,3 +25,11 @@
 
           - name: Run Python script
             run: python main.py # Replace main.py with your script's name
+            env: 
+              TRADIER_ACCESS_TOKEN: ${{ secrets.TRADIER_ACCESS_TOKEN }}
+              TRADIER_ACCOUNT_ID: ${{ secrets.TRADIER_ACCOUNT_ID }}
+              SMTP_HOST: ${{ secrets.SMTP_HOST }}
+              SMTP_USER: ${{ secrets.SMTP_USER }}
+              SMTP_PASS: ${{ secrets.SMTP_PASS }}
+              EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+              EMAIL_TO: ${{ secrets.EMAIL_TO }}
