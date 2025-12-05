@@ -46,7 +46,7 @@ SLA_SECS     = 10
 MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))  # immediate retries per request on timeout only
 
 # Logging
-MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "1000"))
+MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "50"))
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def today_str(): return date.today().isoformat()
