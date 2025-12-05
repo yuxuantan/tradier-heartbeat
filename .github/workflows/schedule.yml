@@ -1,4 +1,4 @@
-    name: Scheduled Python Script
+    name: Scheduled Heartbeat Script
 
     on:
       schedule:
