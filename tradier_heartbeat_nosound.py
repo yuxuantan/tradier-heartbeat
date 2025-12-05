@@ -20,11 +20,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# === Keep system awake while this script runs ===
-# (Use -ims if you want display to be able to sleep; -dims keeps display on)
-caffeinate = subprocess.Popen(["caffeinate", "-dims"])
-atexit.register(lambda: caffeinate.terminate())
-
 # === CONFIG ===
 TRADIER_ACCESS_TOKEN = os.getenv("TRADIER_ACCESS_TOKEN")
 ACCOUNT_ID           = os.getenv("TRADIER_ACCOUNT_ID")
