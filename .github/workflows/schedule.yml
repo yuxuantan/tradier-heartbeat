@@ -1,0 +1,26 @@
+    name: Scheduled Python Script
+
+    on:
+      schedule:
+        # Runs every day at 00:00 UTC
+        - cron: '0 0 * * *'
+      # Allows manual triggering of the workflow
+      workflow_dispatch:
+
+    jobs:
+      run_script:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Checkout repository
+            uses: actions/checkout@v4
+
+          - name: Set up Python
+            uses: actions/setup-python@v5
+            with:
+              python-version: '3.x' # Specify your desired Python version
+
+          - name: Install dependencies
+            run: pip install -r requirements.txt # Only if you have a requirements.txt
+
+          - name: Run Python script
+            run: python main.py # Replace main.py with your script's name

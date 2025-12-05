@@ -1,0 +1,4 @@
+# External libraries required by your script
+requests
+python-dotenv
+playsound
