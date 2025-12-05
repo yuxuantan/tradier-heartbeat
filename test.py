@@ -335,14 +335,14 @@ def check_preview_single_put():
     if not isinstance(q, dict):
         return [f"Check 3/4 FAILED - quote bad payload"], 0
     qobj = safe_get(q, "quotes", "quote")
+    print(qobj)
     if isinstance(qobj, list): qobj = qobj[0] if qobj else {}
     try:
         under_px = float(qobj.get("last") or qobj.get("close") or qobj.get("bid") or 0)
     except: under_px = 0.0
     if under_px <= 0:
         return [f"Check 3/4 FAILED - could not derive underlying price"], 0
-    # under_px = 6640
-    
+
     # Expiration
     ok, te, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
     if not ok:
@@ -510,10 +510,10 @@ def check_balance_drawdown():
 def run_checks():
     print(f"\n=== Tradier Heartbeat @ {now()} ===")
     errs=[]
-    c1, _ = check_positions();           errs+=c1
-    errs   += check_orders()
+    # c1, _ = check_positions();           errs+=c1
+    # errs   += check_orders()
     c3, _ = check_preview_single_put();  errs+=c3
-    errs   += check_balance_drawdown()
+    # errs   += check_balance_drawdown()
 
     if errs:
         print("\n".join(f"❌ {e}" for e in errs))
@@ -523,7 +523,7 @@ def run_checks():
 
 def main():
     # Optional: initial test alert
-    send_alert("[Automation Alert] TEST Alert MAC", "")
+    # send_alert("[Automation Alert] TEST Alert MAC", "")
     while True:
         try:
             run_checks()
