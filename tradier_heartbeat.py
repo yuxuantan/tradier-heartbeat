@@ -13,7 +13,7 @@ Enhancement:
 - Per-request immediate retries: each HTTP call retries up to N times (default 3) only on true timeouts.
 """
 
-import os, time, json, smtplib, traceback, requests, atexit, subprocess
+import os, time, json, smtplib, traceback, requests, atexit, subprocess, threading
 from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
@@ -52,7 +52,7 @@ SLA_SECS     = 10
 MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))  # immediate retries per request on timeout only
 
 # Logging
-MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "1000"))
+MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", "100"))
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def today_str(): return date.today().isoformat()
@@ -71,6 +71,48 @@ def alert_with_vol(volume_level: int):
     except Exception as e:
         print(f"[{now()}] ⚠️ Could not play `sound: {e}")
 
+def alert_with_rising_volume():
+    stop_flag = {"stop": False}
+
+    def wait_for_user():
+        input("\nPress ENTER to stop the alert...\n")
+        stop_flag["stop"] = True
+
+    # Start a background thread waiting for user input
+    threading.Thread(target=wait_for_user, daemon=True).start()
+
+    volume = 20  # starting volume (you can change)
+    print("🚨 Starting alert...")
+
+    while not stop_flag["stop"]:
+        # --- Set Volume ---
+        safe_volume = max(0, min(100, int(volume)))
+        subprocess.run([
+            "osascript",
+            "-e", "set volume output muted false",
+            "-e", f"set volume output volume {safe_volume}"
+        ], check=True)
+
+        print(f"🔊 Volume: {safe_volume}")
+
+        # --- Play alert sequence ---
+        try:
+            playsound("alarm-bell-47839.mp3")
+            playsound("alarm-bell-47839.mp3")
+            playsound("alarm-bell-47839.mp3")
+            playsound("alarm2.wav")
+        except Exception as e:
+            print(f"⚠️ Could not play alert sound: {e}")
+
+        # --- Increase volume for next loop ---
+        volume += 10
+        if volume > 100:
+            volume = 100  # stay at max volume
+
+        time.sleep(0.5)  # slight pause so loop cycles smoothly
+
+    print("🛑 Alert stopped by user.")
+
 def send_alert(subject, body):
     if not (SMTP_HOST and SMTP_PORT and EMAIL_FROM and EMAIL_TO):
         print(f"[{now()}] ⚠️ Email not sent (SMTP vars missing)\n{body}")
@@ -86,7 +128,7 @@ def send_alert(subject, body):
             print(f"[{now()}] 📧 Alert email sent.")
         except Exception as e:
             print(f"[{now()}] ❌ Email send failed: {e}")
-    alert_with_vol(50)
+    alert_with_rising_volume()
 
 # === Utilities ===
 def _pretty(obj):
