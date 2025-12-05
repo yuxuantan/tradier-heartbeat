@@ -17,7 +17,6 @@ import os, time, json, smtplib, traceback, requests, atexit, subprocess
 from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
-from playsound import playsound
 
 load_dotenv()
 
@@ -58,19 +57,6 @@ def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def today_str(): return date.today().isoformat()
 
 # === Alert (email + sound) ===
-def alert_with_vol(volume_level: int):
-    volume_level = max(0, min(100, int(volume_level)))
-    subprocess.run(["osascript", "-e", "set volume output muted false",
-                               "-e", f"set volume output volume {volume_level}"], check=True)
-    print("🔈 Alert sound played on Mac")
-    try:
-        playsound("alarm-bell-47839.mp3")
-        playsound("alarm-bell-47839.mp3")
-        playsound("alarm-bell-47839.mp3")
-        playsound("alarm2.wav")
-    except Exception as e:
-        print(f"[{now()}] ⚠️ Could not play `sound: {e}")
-
 def send_alert(subject, body):
     if not (SMTP_HOST and SMTP_PORT and EMAIL_FROM and EMAIL_TO):
         print(f"[{now()}] ⚠️ Email not sent (SMTP vars missing)\n{body}")
@@ -86,7 +72,6 @@ def send_alert(subject, body):
             print(f"[{now()}] 📧 Alert email sent.")
         except Exception as e:
             print(f"[{now()}] ❌ Email send failed: {e}")
-    alert_with_vol(50)
 
 # === Utilities ===
 def _pretty(obj):
@@ -335,14 +320,14 @@ def check_preview_single_put():
     if not isinstance(q, dict):
         return [f"Check 3/4 FAILED - quote bad payload"], 0
     qobj = safe_get(q, "quotes", "quote")
-    print(qobj)
     if isinstance(qobj, list): qobj = qobj[0] if qobj else {}
     try:
         under_px = float(qobj.get("last") or qobj.get("close") or qobj.get("bid") or 0)
     except: under_px = 0.0
     if under_px <= 0:
         return [f"Check 3/4 FAILED - could not derive underlying price"], 0
-
+    # under_px = 6640
+    
     # Expiration
     ok, te, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
     if not ok:
@@ -510,10 +495,10 @@ def check_balance_drawdown():
 def run_checks():
     print(f"\n=== Tradier Heartbeat @ {now()} ===")
     errs=[]
-    # c1, _ = check_positions();           errs+=c1
-    # errs   += check_orders()
+    c1, _ = check_positions();           errs+=c1
+    errs   += check_orders()
     c3, _ = check_preview_single_put();  errs+=c3
-    # errs   += check_balance_drawdown()
+    errs   += check_balance_drawdown()
 
     if errs:
         print("\n".join(f"❌ {e}" for e in errs))
@@ -523,7 +508,7 @@ def run_checks():
 
 def main():
     # Optional: initial test alert
-    # send_alert("[Automation Alert] TEST Alert MAC", "")
+    send_alert("[Automation Alert] TEST Alert MAC", "")
     while True:
         try:
             run_checks()
