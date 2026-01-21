@@ -1,10 +1,10 @@
     name: Scheduled Heartbeat Script
 
     on:
-      schedule:
-        # Runs at 2:30 PM UTC every weekday (Monday through Friday)
-        # This corresponds to 9:30 AM EST
-        - cron: '30 14 * * 1-5' 
+      # schedule:
+      #   # Runs at 2:30 PM UTC every weekday (Monday through Friday)
+      #   # This corresponds to 9:30 AM EST
+      #   - cron: '30 14 * * 1-5' 
       # Allows manual triggering of the workflow
       workflow_dispatch:
 

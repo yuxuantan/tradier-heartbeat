@@ -383,7 +383,7 @@ def check_preview_single_put():
     except: under_px = 0.0
     if under_px <= 0:
         return [f"Check 3/4 FAILED - could not derive underlying price"], 0
-    # under_px = 6640
+    # under_px = 6940
     
     # Expiration
     ok, te, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
