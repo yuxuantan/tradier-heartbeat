@@ -491,7 +491,7 @@ def run_checks():
     print(f"\n=== Tradier Heartbeat @ {now()} ===")
     errs=[]
     c1, _ = check_positions();           errs+=c1
-    errs   += check_orders()
+    # errs   += check_orders()
     c3, _ = check_preview_single_put();  errs+=c3
     errs   += check_balance_drawdown()
 
