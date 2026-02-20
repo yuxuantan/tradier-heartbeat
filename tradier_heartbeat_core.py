@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""
+Shared Tradier heartbeat engine.
+
+This module centralizes the monitoring/check logic and exposes runtime knobs so
+small wrappers can run it in different environments:
+- local mode: keep-awake + rising-volume alarm
+- CI mode: email-only alerts, no local audio interaction
+"""
+
+import atexit
+import json
+import os
+import smtplib
+import subprocess
+import threading
+import time
+import traceback
+from datetime import date, datetime
+from email.mime.text import MIMEText
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# === CONFIG ===
+TRADIER_ACCESS_TOKEN = os.getenv("TRADIER_ACCESS_TOKEN")
+ACCOUNT_ID = os.getenv("TRADIER_ACCOUNT_ID")
+BASE_URL = os.getenv("TRADIER_BASE_URL", "https://api.tradier.com/v1").rstrip("/")
+HEARTBEAT_SYMBOL = os.getenv("HEARTBEAT_SYMBOL", "SPX").upper()
+ORDER_QTY = int(os.getenv("ORDER_QTY", "1"))
+
+# Balance check config
+BALANCE_STORE = os.getenv("BALANCE_STORE", "balance_store.json")
+BALANCE_DD_LIMIT_PCT = float(os.getenv("BALANCE_DD_LIMIT_PCT", "2.0"))  # 2% default
+
+# Email + alert
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587")) if os.getenv("SMTP_HOST") else None
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
+# HTTP
+HEADERS = {"Authorization": f"Bearer {TRADIER_ACCESS_TOKEN}", "Accept": "application/json"}
+REQ_TIMEOUT = 10  # per request timeout seconds
+SLA_SECS = 10
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # immediate retries per request on timeout only
+
+# Runtime mode toggles (configured by wrappers)
+ENABLE_SOUND_ALERT = False
+MAX_PRINT_CHARS = 50
+_CAFFEINATE_PROC = None
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str():
+    return date.today().isoformat()
+
+
+# === Runtime mode ===
+def _stop_keep_awake():
+    global _CAFFEINATE_PROC
+    if _CAFFEINATE_PROC is None:
+        return
+    try:
+        _CAFFEINATE_PROC.terminate()
+    except Exception:
+        pass
+    _CAFFEINATE_PROC = None
+
+
+def _start_keep_awake():
+    global _CAFFEINATE_PROC
+    if _CAFFEINATE_PROC is not None:
+        return
+    try:
+        _CAFFEINATE_PROC = subprocess.Popen(["caffeinate", "-dims"])
+        print(f"[{now()}] ☕️ Started caffeinate keep-awake process.")
+    except Exception as exc:
+        print(f"[{now()}] ⚠️ Could not start caffeinate: {exc}")
+
+
+def configure_runtime(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50):
+    global ENABLE_SOUND_ALERT, MAX_PRINT_CHARS
+    ENABLE_SOUND_ALERT = bool(enable_sound_alert)
+    MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", str(max_print_chars_default)))
+    if keep_awake:
+        _start_keep_awake()
+
+
+atexit.register(_stop_keep_awake)
+
+
+# === Alerting ===
+def _play_alarm_sequence():
+    try:
+        from playsound import playsound
+    except Exception as exc:
+        print(f"[{now()}] ⚠️ Could not import playsound for local alarm: {exc}")
+        return
+
+    try:
+        playsound("alarm-bell-47839.mp3")
+        playsound("alarm-bell-47839.mp3")
+        playsound("alarm-bell-47839.mp3")
+        playsound("alarm2.wav")
+    except Exception as exc:
+        print(f"[{now()}] ⚠️ Could not play alert sound: {exc}")
+
+
+def alert_with_rising_volume():
+    if not ENABLE_SOUND_ALERT:
+        return
+
+    stop_flag = {"stop": False}
+
+    def wait_for_user():
+        try:
+            input("\nPress ENTER to stop the alert...\n")
+            stop_flag["stop"] = True
+        except Exception:
+            # Non-interactive terminal (or input unavailable): keep alert looping.
+            pass
+
+    threading.Thread(target=wait_for_user, daemon=True).start()
+
+    volume = int(os.getenv("ALERT_START_VOLUME", "20"))
+    step = int(os.getenv("ALERT_VOLUME_STEP", "10"))
+    sleep_secs = float(os.getenv("ALERT_LOOP_SLEEP_SECS", "0.5"))
+    print("🚨 Starting alert...")
+
+    while not stop_flag["stop"]:
+        safe_volume = max(0, min(100, int(volume)))
+        try:
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    "set volume output muted false",
+                    "-e",
+                    f"set volume output volume {safe_volume}",
+                ],
+                check=True,
+            )
+            print(f"🔊 Volume: {safe_volume}")
+        except Exception as exc:
+            print(f"[{now()}] ⚠️ Could not set Mac system volume: {exc}")
+
+        _play_alarm_sequence()
+
+        volume += step
+        if volume > 100:
+            volume = 100
+
+        time.sleep(sleep_secs)
+
+    print("🛑 Alert stopped by user.")
+
+
+def send_alert(subject, body):
+    if not (SMTP_HOST and SMTP_PORT and EMAIL_FROM and EMAIL_TO):
+        print(f"[{now()}] ⚠️ Email not sent (SMTP vars missing)\n{body}")
+    else:
+        try:
+            msg = MIMEText(body, "plain")
+            msg["Subject"], msg["From"], msg["To"] = subject, EMAIL_FROM, EMAIL_TO
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp_conn:
+                smtp_conn.starttls()
+                if SMTP_USER and SMTP_PASS:
+                    smtp_conn.login(SMTP_USER, SMTP_PASS)
+                smtp_conn.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+            print(f"[{now()}] 📧 Alert email sent.")
+        except Exception as exc:
+            print(f"[{now()}] ❌ Email send failed: {exc}")
+
+    alert_with_rising_volume()
+
+
+# === Utilities ===
+def _pretty(obj):
+    try:
+        return json.dumps(obj, indent=2, sort_keys=True)
+    except Exception:
+        return str(obj)
+
+
+def _print_response(tag, url, status_code, elapsed, content, is_json_guess=True, attempt=None):
+    body = _pretty(content) if is_json_guess else str(content)
+    if len(body) > MAX_PRINT_CHARS:
+        body = body[:MAX_PRINT_CHARS] + "\n…(truncated)…"
+    att = f" (attempt {attempt})" if attempt is not None else ""
+    print(
+        f"[{now()}] 🔎 {tag}{att}\n"
+        f"URL: {url}\n"
+        f"Status: {status_code} | Elapsed: {elapsed:.2f}s\n"
+        f"Body:\n{body}\n"
+    )
+
+
+def _do_http(method, url, data=None, tag="API", attempt=None):
+    """One attempt only. Returns (ok, elapsed, content, status_code, err_tag)."""
+    start = time.monotonic()
+    try:
+        if method == "get":
+            resp = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
+        else:
+            resp = requests.post(
+                url,
+                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+                data=data,
+                timeout=REQ_TIMEOUT,
+            )
+        elapsed = time.monotonic() - start
+
+        is_json = False
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "application/json" in content_type:
+            try:
+                content = resp.json()
+                is_json = True
+            except Exception:
+                content = resp.text
+        else:
+            try:
+                content = resp.json()
+                is_json = True
+            except Exception:
+                content = resp.text
+
+        _print_response(tag, url, resp.status_code, elapsed, content, is_json_guess=is_json, attempt=attempt)
+        ok = resp.ok and elapsed <= SLA_SECS
+        return ok, elapsed, content, resp.status_code, (None if ok else f"HTTP {resp.status_code}")
+    except requests.exceptions.Timeout:
+        elapsed = time.monotonic() - start
+        print(f"[{now()}] ⏱️ Timeout in {tag} after {elapsed:.2f}s (attempt {attempt})")
+        return False, elapsed, None, None, "timeout"
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        print(f"[{now()}] ❌ {tag} request error: {exc} (elapsed {elapsed:.2f}s) (attempt {attempt})")
+        return False, elapsed, None, None, str(exc)
+
+
+def timed_req(method, url, data=None, tag="API", retries=MAX_RETRIES):
+    """
+    Immediate retries (no backoff) for timeout errors only.
+    Returns final (ok, elapsed_last, content_last, status_code_last, err_tag_last).
+    """
+    last_result = (False, 0.0, None, None, "timeout")
+    for attempt in range(1, retries + 1):
+        ok, elapsed, content, status_code, err = _do_http(method, url, data=data, tag=tag, attempt=attempt)
+        last_result = (ok, elapsed, content, status_code, err)
+        if ok:
+            return last_result
+        if err != "timeout":
+            return last_result
+    return last_result
+
+
+# === API wrappers ===
+def get_positions():
+    return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/positions", tag="Positions")
+
+
+def get_orders():
+    return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders", tag="Orders")
+
+
+def get_quote(sym):
+    return timed_req("get", f"{BASE_URL}/markets/quotes?symbols={sym}", tag=f"Quote {sym}")
+
+
+def get_expirations(sym):
+    return timed_req(
+        "get",
+        f"{BASE_URL}/markets/options/expirations?symbol={sym}&includeAllRoots=true",
+        tag=f"Expirations {sym}",
+    )
+
+
+def get_chain(sym, exp):
+    return timed_req(
+        "get",
+        f"{BASE_URL}/markets/options/chains?symbol={sym}&expiration={exp}",
+        tag=f"Chain {sym} {exp}",
+    )
+
+
+def get_option_quotes(symbols):
+    if isinstance(symbols, (list, tuple)):
+        symbols = ",".join(symbols)
+    url = f"{BASE_URL}/markets/quotes?symbols={symbols}"
+    return timed_req("get", url, tag=f"Option Quotes ({symbols})")
+
+
+def get_balances_now():
+    return timed_req("get", f"{BASE_URL}/accounts/{ACCOUNT_ID}/balances", tag="Balances Now")
+
+
+def get_historical_balances():
+    return timed_req(
+        "get",
+        f"{BASE_URL}/accounts/{ACCOUNT_ID}/historical-balances?period=WEEK",
+        tag="Historical Balances",
+    )
+
+
+def preview_single_option(underlying_symbol, option_symbol, side, qty, limit_price):
+    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders?preview=true"
+    data = {
+        "class": "option",
+        "symbol": underlying_symbol,
+        "option_symbol": option_symbol,
+        "side": side,
+        "quantity": str(qty),
+        "type": "limit",
+        "duration": "day",
+        "price": f"{limit_price:.2f}",
+    }
+    try:
+        print(f"[{now()}] 🧾 Preview payload (single):\n{json.dumps(data, indent=2)}")
+    except Exception:
+        pass
+    return timed_req("post", url, data, tag="Preview Single Option")
+
+
+# === JSON helpers ===
+def safe_get(dct, *path, default=None):
+    cur = dct
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+ACTIVE_STATUSES = {"open", "pending", "live", "accepted", "partially_filled"}
+
+
+def count_active_orders(js):
+    raw = safe_get(js, "orders", "order", default=[])
+    if isinstance(raw, dict):
+        raw = [raw]
+    n_total = len(raw)
+    n_active = sum(1 for item in raw if str(item.get("status", "")).lower() in ACTIVE_STATUSES)
+    return n_total, n_active
+
+
+def pick_atm_put_symbol(chain_json, underlying_price):
+    if not isinstance(chain_json, dict):
+        return None, "chain_json is not a dict"
+    options = safe_get(chain_json, "options", "option", default=[])
+    if isinstance(options, dict):
+        options = [options]
+    puts = [opt for opt in options if str(opt.get("option_type") or opt.get("right") or "").lower() == "put"]
+    if not puts:
+        return None, "no put options in chain"
+
+    def strike_val(opt):
+        try:
+            return float(opt.get("strike"))
+        except Exception:
+            return float("inf")
+
+    puts.sort(key=lambda opt: abs(strike_val(opt) - underlying_price))
+    sym = puts[0].get("symbol") or puts[0].get("option_symbol")
+    if not sym:
+        return None, "no option symbol on selected put"
+    return sym, None
+
+
+def mid_from_bidask(bid, ask):
+    try:
+        bid_val = float(bid) if bid is not None else None
+        ask_val = float(ask) if ask is not None else None
+        if bid_val is not None and ask_val is not None and ask_val >= bid_val:
+            return (ask_val + bid_val) / 2.0
+        if ask_val is not None:
+            return ask_val
+        if bid_val is not None:
+            return bid_val
+    except Exception:
+        pass
+    return None
+
+
+def compute_option_mid(option_symbol):
+    ok, _, quotes, _, err = get_option_quotes(option_symbol)
+    if not ok or not isinstance(quotes, dict):
+        return None, f"option quotes error: {err or 'bad payload'}"
+    qobj = safe_get(quotes, "quotes", "quote")
+    if isinstance(qobj, list):
+        qobj = qobj[0] if qobj else {}
+
+    mid = mid_from_bidask(qobj.get("bid"), qobj.get("ask"))
+    if mid is None:
+        try:
+            mid = float(qobj.get("last"))
+        except Exception:
+            mid = None
+    if mid is None:
+        return None, "insufficient quote data for mid"
+    return max(mid, 0.01), {"bid": qobj.get("bid"), "ask": qobj.get("ask"), "last": qobj.get("last")}
+
+
+# === Local balance store (fallback for #4) ===
+def read_balance_store():
+    try:
+        with open(BALANCE_STORE, "r") as file_obj:
+            return json.load(file_obj)
+    except Exception:
+        return {}
+
+
+def write_balance_store(store):
+    try:
+        with open(BALANCE_STORE, "w") as file_obj:
+            json.dump(store, file_obj, indent=2, sort_keys=True)
+    except Exception as exc:
+        print(f"[{now()}] ⚠️ Could not write balance store: {exc}")
+
+
+def _load_and_update_local_balance_store(today_equity):
+    store = read_balance_store()
+    today = today_str()
+    if today_equity is not None:
+        store[today] = today_equity
+        write_balance_store(store)
+    prior_dates = [d for d in store.keys() if d < today]
+    prior_dates.sort()
+    return store.get(prior_dates[-1]) if prior_dates else None
+
+
+# === Checks ===
+def check_positions():
+    ok, elapsed, js, _, err = get_positions()
+    if not ok:
+        if err == "timeout":
+            return [f"Check 1/4 FAILED - positions API timeout x{MAX_RETRIES}"], None
+        return [f"Check 1/4 FAILED - positions API error ({err}), {elapsed:.2f}s"], None
+
+    if not isinstance(js, dict):
+        return ["Check 1/4 FAILED - positions bad payload"], js
+    items = safe_get(js, "positions", "position", default=[])
+    if isinstance(items, dict):
+        items = [items]
+    count = len(items)
+    if count >= 1 and elapsed <= SLA_SECS:
+        print(f"✅ Check 1/4 passed - detected {count} positions (> minimum 1). Response {elapsed:.2f}s.")
+        return [], js
+    return [f"Check 1/4 FAILED - {count} positions (need ≥1) or slow (> {SLA_SECS}s, {elapsed:.2f}s)"], js
+
+
+def check_orders():
+    ok, elapsed, js, _, err = get_orders()
+    if not ok:
+        if err == "timeout":
+            return [f"Check 2/4 FAILED - orders API timeout x{MAX_RETRIES}"]
+        return [f"Check 2/4 FAILED - orders API error ({err}), {elapsed:.2f}s"]
+
+    if not isinstance(js, dict):
+        return ["Check 2/4 FAILED - orders bad payload"]
+    total, active = count_active_orders(js)
+    if active >= 1 and elapsed <= SLA_SECS:
+        print(
+            f"✅ Check 2/4 passed - detected {active} active order(s) "
+            f"(total returned {total}). Response {elapsed:.2f}s."
+        )
+        return []
+    return [
+        f"Check 2/4 FAILED - zero active orders (active={active}, total={total}) "
+        f"or slow (> {SLA_SECS}s, {elapsed:.2f}s)"
+    ]
+
+
+def check_preview_single_put():
+    ok, _, quote_payload, _, err = get_quote(HEARTBEAT_SYMBOL)
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - quote timeout x{MAX_RETRIES}"], 0
+        return [f"Check 3/4 FAILED - quote error {err or 'bad payload'}"], 0
+    if not isinstance(quote_payload, dict):
+        return ["Check 3/4 FAILED - quote bad payload"], 0
+
+    qobj = safe_get(quote_payload, "quotes", "quote")
+    if isinstance(qobj, list):
+        qobj = qobj[0] if qobj else {}
+    try:
+        under_px = float(qobj.get("last") or qobj.get("close") or qobj.get("bid") or 0)
+    except Exception:
+        under_px = 0.0
+    if under_px <= 0:
+        return ["Check 3/4 FAILED - could not derive underlying price"], 0
+
+    ok, _, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - expirations timeout x{MAX_RETRIES}"], 0
+        return [f"Check 3/4 FAILED - expirations error {err or 'bad payload'}"], 0
+    if not isinstance(exps, dict):
+        return ["Check 3/4 FAILED - expirations bad payload"], 0
+
+    raw = safe_get(exps, "expirations", "date", default=[])
+    if isinstance(raw, str):
+        raw = [raw]
+    if not raw:
+        return ["Check 3/4 FAILED - no expirations available"], 0
+
+    prefer = date.today().isoformat()
+    exp = (
+        prefer
+        if prefer in raw
+        else (sorted([d for d in raw if d >= prefer])[0] if any(d >= prefer for d in raw) else sorted(raw)[-1])
+    )
+
+    ok, _, chain, _, err = get_chain(HEARTBEAT_SYMBOL, exp)
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - chain timeout x{MAX_RETRIES}"], 0
+        return [f"Check 3/4 FAILED - chain error {err or 'bad payload'} for {exp}"], 0
+    if not isinstance(chain, dict):
+        return [f"Check 3/4 FAILED - chain bad payload for {exp}"], 0
+
+    opt_sym, pick_err = pick_atm_put_symbol(chain, under_px)
+    if not opt_sym:
+        return [f"Check 3/4 FAILED - {pick_err or 'ATM put selection error'} for {exp}"], 0
+
+    mid, details = compute_option_mid(opt_sym)
+    if mid is None:
+        return [f"Check 3/4 FAILED - cannot compute mid price ({details})"], 0
+
+    try:
+        print(
+            f"[{now()}] 🔢 ATM PUT mid: {mid:.2f} "
+            f"(bid={details['bid']}, ask={details['ask']}, last={details['last']})"
+        )
+    except Exception:
+        print(f"[{now()}] 🔢 ATM PUT mid: {mid}")
+
+    ok, preview_elapsed, preview_payload, _, err = preview_single_option(
+        underlying_symbol=HEARTBEAT_SYMBOL,
+        option_symbol=opt_sym,
+        side="buy_to_open",
+        qty=ORDER_QTY,
+        limit_price=mid,
+    )
+    if not ok:
+        if err == "timeout":
+            return [f"Check 3/4 FAILED - preview timeout x{MAX_RETRIES}"], 0
+        return [f"Check 3/4 FAILED - preview error {err or 'bad payload'}, {preview_elapsed:.2f}s"], 0
+
+    if not isinstance(preview_payload, dict):
+        return ["Check 3/4 FAILED - preview bad payload"], 0
+    status_txt = str(safe_get(preview_payload, "order", "status", default="ok")).lower()
+    if "ok" in status_txt:
+        print(f"✅ Check 3/4 passed - single-leg ATM PUT preview OK for {exp}. Response {preview_elapsed:.2f}s.")
+        return [], preview_elapsed
+    return [f"Check 3/4 FAILED - preview status='{status_txt}' for {exp}, {preview_elapsed:.2f}s"], preview_elapsed
+
+
+def _extract_total_equity_from_balances_now(js):
+    total_equity = safe_get(js, "balances", "total_equity")
+    if total_equity is None:
+        total_equity = safe_get(js, "balances", "equity")
+    try:
+        return float(total_equity) if total_equity is not None else None
+    except Exception:
+        return None
+
+
+def _extract_series_from_historical(js):
+    root = safe_get(js, "historical_balances", "balances")
+    if not isinstance(root, dict):
+        return []
+
+    bal = root.get("balance")
+    if bal is None:
+        return []
+    if isinstance(bal, dict):
+        bal = [bal]
+
+    out = []
+    for row in bal:
+        try:
+            row_date = str(row.get("date"))
+            total_equity = row.get("value")
+            total_equity = float(total_equity) if total_equity is not None else None
+            if row_date and total_equity is not None:
+                out.append({"date": row_date, "total_equity": total_equity})
+        except Exception:
+            continue
+
+    out.sort(key=lambda x: x["date"])
+    return out
+
+
+def check_balance_drawdown():
+    ok_now, elapsed_now, js_now, _, err_now = get_balances_now()
+    if not ok_now:
+        if err_now == "timeout":
+            return [f"Check 4/4 FAILED - balances now timeout x{MAX_RETRIES}"]
+        return [f"Check 4/4 FAILED - balances API error ({err_now}), {elapsed_now:.2f}s"]
+    if not isinstance(js_now, dict):
+        return ["Check 4/4 FAILED - balances now bad payload"]
+
+    today_equity = _extract_total_equity_from_balances_now(js_now)
+    if today_equity is None:
+        return ["Check 4/4 FAILED - could not parse today's total equity from balances payload"]
+
+    ok_hist, _, js_hist, _, err_hist = get_historical_balances()
+    prev = None
+    if ok_hist and isinstance(js_hist, dict):
+        series = _extract_series_from_historical(js_hist)
+        if series:
+            prior = [row for row in series if row["date"] < today_str()]
+            if prior:
+                prev = prior[-1]["total_equity"]
+    elif err_hist == "timeout":
+        print(f"[{now()}] ⚠️ Historical balances timeout x{MAX_RETRIES}; using local store fallback")
+    else:
+        print(f"[{now()}] ⚠️ Historical balances API unavailable; using local store fallback")
+
+    if prev is None:
+        prev = _load_and_update_local_balance_store(today_equity)
+        if prev is None:
+            print("ℹ️ Check 4/4 fallback - no prior balance available yet; stored today's value for future comparisons.")
+            return []
+
+    drop_pct = (prev - today_equity) / prev * 100.0
+    if drop_pct > BALANCE_DD_LIMIT_PCT:
+        return [
+            f"Check 4/4 FAILED - equity drop {drop_pct:.2f}% exceeds {BALANCE_DD_LIMIT_PCT:.2f}% "
+            f"(prev={prev:.2f}, today={today_equity:.2f})"
+        ]
+
+    print(
+        f"✅ Check 4/4 passed - equity drop {drop_pct:.2f}% within limit "
+        f"(prev={prev:.2f}, today={today_equity:.2f})."
+    )
+    _load_and_update_local_balance_store(today_equity)
+    return []
+
+
+# === Orchestration ===
+def run_checks():
+    print(f"\n=== Tradier Heartbeat @ {now()} ===")
+    errs = []
+    check1_errs, _ = check_positions()
+    errs += check1_errs
+    # errs += check_orders()
+    check3_errs, _ = check_preview_single_put()
+    errs += check3_errs
+    errs += check_balance_drawdown()
+
+    if errs:
+        print("\n".join(f"❌ {err}" for err in errs))
+        send_alert(
+            f"[Automation Alert] Tradier Heartbeat Failures ({len(errs)}) @ {now()}",
+            "\n".join(errs),
+        )
+    else:
+        print("✅ All 4 checks passed successfully.\n")
+
+
+def run_forever(send_initial_test_alert=True):
+    if send_initial_test_alert:
+        send_alert("[Automation Alert] TEST Alert MAC", "")
+
+    while True:
+        try:
+            run_checks()
+        except Exception as exc:
+            tb = traceback.format_exc()
+            send_alert("[Automation Alert] Heartbeat Script Crash", f"{exc}\n{tb}")
+            print(tb)
+        time.sleep(60)
+
+
+def run(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50, send_initial_test_alert=True):
+    configure_runtime(
+        enable_sound_alert=enable_sound_alert,
+        keep_awake=keep_awake,
+        max_print_chars_default=max_print_chars_default,
+    )
+    run_forever(send_initial_test_alert=send_initial_test_alert)
+
+
+if __name__ == "__main__":
+    run(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50, send_initial_test_alert=True)
