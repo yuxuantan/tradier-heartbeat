@@ -7,7 +7,7 @@ Runs every minute (kept awake via `caffeinate`) and performs 4 checks:
 2) Orders endpoint responds within 10s and has ≥1 ACTIVE order.
 3) Preview single-leg BUY PUT (ATM, today or nearest expiry) at mid price returns status 'ok' within 10s.
 4) Balance drawdown guard: today's total equity vs. yesterday's (from historical-balances or local store);
-   if drop > BALANCE_DD_LIMIT_PCT (default 3%), fail & alert.
+   if drop > BALANCE_DD_LIMIT_PCT (default 2%), fail & alert.
 
 Enhancement:
 - Per-request immediate retries: each HTTP call retries up to N times (default 3) only on true timeouts.
@@ -35,7 +35,7 @@ ORDER_QTY            = int(os.getenv("ORDER_QTY", "1"))
 
 # Balance check config
 BALANCE_STORE        = os.getenv("BALANCE_STORE", "balance_store.json")
-BALANCE_DD_LIMIT_PCT = float(os.getenv("BALANCE_DD_LIMIT_PCT", "3.0"))  # 3% default
+BALANCE_DD_LIMIT_PCT = float(os.getenv("BALANCE_DD_LIMIT_PCT", "2.0"))  # 2% default
 
 # Email + alert
 SMTP_HOST  = os.getenv("SMTP_HOST")
