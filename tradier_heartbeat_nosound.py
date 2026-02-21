@@ -10,4 +10,5 @@ if __name__ == "__main__":
         keep_awake=False,
         max_print_chars_default=50,
         send_initial_test_alert=True,
+        run_context="GitHub Actions",
     )

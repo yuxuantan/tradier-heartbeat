@@ -53,6 +53,7 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # immediate retries per reques
 ENABLE_SOUND_ALERT = False
 MAX_PRINT_CHARS = 50
 _CAFFEINATE_PROC = None
+RUN_CONTEXT = "Unknown"
 
 
 def now():
@@ -64,6 +65,12 @@ def today_str():
 
 
 # === Runtime mode ===
+def _default_run_context():
+    if str(os.getenv("GITHUB_ACTIONS", "")).lower() == "true":
+        return "GitHub Actions"
+    return "Local PC"
+
+
 def _stop_keep_awake():
     global _CAFFEINATE_PROC
     if _CAFFEINATE_PROC is None:
@@ -86,10 +93,11 @@ def _start_keep_awake():
         print(f"[{now()}] ⚠️ Could not start caffeinate: {exc}")
 
 
-def configure_runtime(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50):
-    global ENABLE_SOUND_ALERT, MAX_PRINT_CHARS
+def configure_runtime(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50, run_context=None):
+    global ENABLE_SOUND_ALERT, MAX_PRINT_CHARS, RUN_CONTEXT
     ENABLE_SOUND_ALERT = bool(enable_sound_alert)
     MAX_PRINT_CHARS = int(os.getenv("MAX_PRINT_CHARS", str(max_print_chars_default)))
+    RUN_CONTEXT = (run_context or os.getenv("HEARTBEAT_RUN_CONTEXT") or _default_run_context()).strip()
     if keep_awake:
         _start_keep_awake()
 
@@ -180,6 +188,10 @@ def send_alert(subject, body):
             print(f"[{now()}] ❌ Email send failed: {exc}")
 
     alert_with_rising_volume()
+
+
+def context_subject(title):
+    return f"[Automation Alert][{RUN_CONTEXT}] {title}"
 
 
 # === Utilities ===
@@ -660,7 +672,7 @@ def run_checks():
     if errs:
         print("\n".join(f"❌ {err}" for err in errs))
         send_alert(
-            f"[Automation Alert] Tradier Heartbeat Failures ({len(errs)}) @ {now()}",
+            context_subject(f"Tradier Heartbeat Failures ({len(errs)}) @ {now()}"),
             "\n".join(errs),
         )
     else:
@@ -669,26 +681,39 @@ def run_checks():
 
 def run_forever(send_initial_test_alert=True):
     if send_initial_test_alert:
-        send_alert("[Automation Alert] TEST Alert MAC", "")
+        send_alert(context_subject("TEST Alert"), "")
 
     while True:
         try:
             run_checks()
         except Exception as exc:
             tb = traceback.format_exc()
-            send_alert("[Automation Alert] Heartbeat Script Crash", f"{exc}\n{tb}")
+            send_alert(context_subject("Heartbeat Script Crash"), f"{exc}\n{tb}")
             print(tb)
         time.sleep(60)
 
 
-def run(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50, send_initial_test_alert=True):
+def run(
+    enable_sound_alert=False,
+    keep_awake=False,
+    max_print_chars_default=50,
+    send_initial_test_alert=True,
+    run_context=None,
+):
     configure_runtime(
         enable_sound_alert=enable_sound_alert,
         keep_awake=keep_awake,
         max_print_chars_default=max_print_chars_default,
+        run_context=run_context,
     )
     run_forever(send_initial_test_alert=send_initial_test_alert)
 
 
 if __name__ == "__main__":
-    run(enable_sound_alert=False, keep_awake=False, max_print_chars_default=50, send_initial_test_alert=True)
+    run(
+        enable_sound_alert=False,
+        keep_awake=False,
+        max_print_chars_default=50,
+        send_initial_test_alert=True,
+        run_context="GitHub Actions",
+    )
