@@ -11,6 +11,7 @@ small wrappers can run it in different environments:
 import atexit
 import json
 import os
+import shutil
 import smtplib
 import subprocess
 import threading
@@ -106,7 +107,35 @@ atexit.register(_stop_keep_awake)
 
 
 # === Alerting ===
-def _play_alarm_sequence():
+def _play_alarm_sequence(stop_flag=None):
+    sound_files = ["alarm-bell-47839.mp3", "alarm-bell-47839.mp3", "alarm-bell-47839.mp3", "alarm2.wav"]
+    afplay_path = shutil.which("afplay")
+
+    # Prefer afplay on macOS because we can interrupt playback immediately when user hits ENTER.
+    if afplay_path:
+        for sound_file in sound_files:
+            if stop_flag and stop_flag.get("stop"):
+                return
+            try:
+                proc = subprocess.Popen([afplay_path, sound_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as exc:
+                print(f"[{now()}] ⚠️ Could not start afplay for {sound_file}: {exc}")
+                continue
+
+            while proc.poll() is None:
+                if stop_flag and stop_flag.get("stop"):
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    return
+                time.sleep(0.05)
+        return
+
     try:
         from playsound import playsound
     except Exception as exc:
@@ -114,10 +143,10 @@ def _play_alarm_sequence():
         return
 
     try:
-        playsound("alarm-bell-47839.mp3")
-        playsound("alarm-bell-47839.mp3")
-        playsound("alarm-bell-47839.mp3")
-        playsound("alarm2.wav")
+        for sound_file in sound_files:
+            if stop_flag and stop_flag.get("stop"):
+                return
+            playsound(sound_file)
     except Exception as exc:
         print(f"[{now()}] ⚠️ Could not play alert sound: {exc}")
 
@@ -160,7 +189,7 @@ def alert_with_rising_volume():
         except Exception as exc:
             print(f"[{now()}] ⚠️ Could not set Mac system volume: {exc}")
 
-        _play_alarm_sequence()
+        _play_alarm_sequence(stop_flag=stop_flag)
 
         volume += step
         if volume > 100:
@@ -462,10 +491,10 @@ def check_positions():
     if isinstance(items, dict):
         items = [items]
     count = len(items)
-    if count >= 1 and elapsed <= SLA_SECS:
-        print(f"✅ Check 1/4 passed - detected {count} positions (> minimum 1). Response {elapsed:.2f}s.")
+    if elapsed <= SLA_SECS:
+        print(f"✅ Check 1/4 passed - detected {count} positions (minimum 0). Response {elapsed:.2f}s.")
         return [], js
-    return [f"Check 1/4 FAILED - {count} positions (need ≥1) or slow (> {SLA_SECS}s, {elapsed:.2f}s)"], js
+    return [f"Check 1/4 FAILED - slow positions response (> {SLA_SECS}s, {elapsed:.2f}s)"], js
 
 
 def check_orders():
