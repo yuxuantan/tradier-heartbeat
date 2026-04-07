@@ -50,11 +50,27 @@ REQ_TIMEOUT = 10  # per request timeout seconds
 SLA_SECS = 10
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # immediate retries per request on timeout only
 
+# Consecutive-failure alert thresholds
+FAILURE_CATEGORY_DEFAULT = "default"
+FAILURE_CATEGORY_BALANCE_DRAWDOWN = "balance_drawdown"
+FAILURE_CATEGORY_SCRIPT_CRASH = "script_crash"
+FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN = "quote_preview_chain"
+FAILURE_CATEGORY_SLOW_RESPONSE = "slow_response"
+
+FAILURE_THRESHOLDS = {
+    FAILURE_CATEGORY_DEFAULT: int(os.getenv("ALERT_CONSEC_DEFAULT", "1")),
+    FAILURE_CATEGORY_BALANCE_DRAWDOWN: int(os.getenv("ALERT_CONSEC_BALANCE_DRAWDOWN", "1")),
+    FAILURE_CATEGORY_SCRIPT_CRASH: int(os.getenv("ALERT_CONSEC_SCRIPT_CRASH", "1")),
+    FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN: int(os.getenv("ALERT_CONSEC_QUOTE_PREVIEW_CHAIN", "2")),
+    FAILURE_CATEGORY_SLOW_RESPONSE: int(os.getenv("ALERT_CONSEC_SLOW_RESPONSE", "3")),
+}
+
 # Runtime mode toggles (configured by wrappers)
 ENABLE_SOUND_ALERT = False
 MAX_PRINT_CHARS = 50
 _CAFFEINATE_PROC = None
 RUN_CONTEXT = "Unknown"
+_CONSECUTIVE_FAILURE_COUNTS = {}
 
 
 def now():
@@ -224,6 +240,64 @@ def context_subject(title):
 
 
 # === Utilities ===
+def build_failure(message, category=FAILURE_CATEGORY_DEFAULT, key=None, details=None):
+    failure = {
+        "message": message,
+        "category": category,
+        "key": key or message,
+    }
+    if details:
+        failure["details"] = details
+    return failure
+
+
+def _failure_threshold(category):
+    return FAILURE_THRESHOLDS.get(category, FAILURE_THRESHOLDS[FAILURE_CATEGORY_DEFAULT])
+
+
+def _apply_failure_thresholds(failures):
+    global _CONSECUTIVE_FAILURE_COUNTS
+
+    next_counts = {}
+    alert_failures = []
+
+    for failure in failures:
+        key = failure["key"]
+        if key in next_counts:
+            count = next_counts[key]
+        else:
+            count = _CONSECUTIVE_FAILURE_COUNTS.get(key, 0) + 1
+            next_counts[key] = count
+
+        threshold = _failure_threshold(failure["category"])
+        failure["count"] = count
+        failure["threshold"] = threshold
+
+        if count >= threshold:
+            alert_failures.append(failure)
+            continue
+
+        print(
+            f"[{now()}] 🔕 Alert suppressed for {key}: "
+            f"{count}/{threshold} consecutive failure(s)."
+        )
+
+    _CONSECUTIVE_FAILURE_COUNTS = next_counts
+    return alert_failures
+
+
+def _format_failure_for_alert(failure):
+    line = failure["message"]
+    threshold = failure.get("threshold", 1)
+    count = failure.get("count", 1)
+    if threshold > 1:
+        line = f"{line} [consecutive {count}/{threshold}]"
+    details = failure.get("details")
+    if details:
+        return f"{line}\n{details}"
+    return line
+
+
 def _pretty(obj):
     try:
         return json.dumps(obj, indent=2, sort_keys=True)
@@ -275,8 +349,11 @@ def _do_http(method, url, data=None, tag="API", attempt=None):
                 content = resp.text
 
         _print_response(tag, url, resp.status_code, elapsed, content, is_json_guess=is_json, attempt=attempt)
-        ok = resp.ok and elapsed <= SLA_SECS
-        return ok, elapsed, content, resp.status_code, (None if ok else f"HTTP {resp.status_code}")
+        if resp.ok and elapsed <= SLA_SECS:
+            return True, elapsed, content, resp.status_code, None
+        if resp.ok:
+            return False, elapsed, content, resp.status_code, "slow_response"
+        return False, elapsed, content, resp.status_code, f"HTTP {resp.status_code}"
     except requests.exceptions.Timeout:
         elapsed = time.monotonic() - start
         print(f"[{now()}] ⏱️ Timeout in {tag} after {elapsed:.2f}s (attempt {attempt})")
@@ -431,8 +508,10 @@ def mid_from_bidask(bid, ask):
 
 
 def compute_option_mid(option_symbol):
-    ok, _, quotes, _, err = get_option_quotes(option_symbol)
+    ok, elapsed, quotes, _, err = get_option_quotes(option_symbol)
     if not ok or not isinstance(quotes, dict):
+        if err == "slow_response":
+            return None, f"slow_response:{elapsed:.2f}"
         return None, f"option quotes error: {err or 'bad payload'}"
     qobj = safe_get(quotes, "quotes", "quote")
     if isinstance(qobj, list):
@@ -482,51 +561,82 @@ def check_positions():
     ok, elapsed, js, _, err = get_positions()
     if not ok:
         if err == "timeout":
-            return [f"Check 1/4 FAILED - positions API timeout x{MAX_RETRIES}"], None
-        return [f"Check 1/4 FAILED - positions API error ({err}), {elapsed:.2f}s"], None
+            return [build_failure(f"Check 1/4 FAILED - positions API timeout x{MAX_RETRIES}", key="positions_timeout")], None
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 1/4 FAILED - slow positions response (> {SLA_SECS}s, {elapsed:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="positions_slow",
+                )
+            ], js
+        return [build_failure(f"Check 1/4 FAILED - positions API error ({err}), {elapsed:.2f}s", key="positions_error")], None
 
     if not isinstance(js, dict):
-        return ["Check 1/4 FAILED - positions bad payload"], js
+        return [build_failure("Check 1/4 FAILED - positions bad payload", key="positions_bad_payload")], js
     items = safe_get(js, "positions", "position", default=[])
     if isinstance(items, dict):
         items = [items]
     count = len(items)
-    if elapsed <= SLA_SECS:
-        print(f"✅ Check 1/4 passed - detected {count} positions (minimum 0). Response {elapsed:.2f}s.")
-        return [], js
-    return [f"Check 1/4 FAILED - slow positions response (> {SLA_SECS}s, {elapsed:.2f}s)"], js
+    print(f"✅ Check 1/4 passed - detected {count} positions (minimum 0). Response {elapsed:.2f}s.")
+    return [], js
 
 
 def check_orders():
     ok, elapsed, js, _, err = get_orders()
     if not ok:
         if err == "timeout":
-            return [f"Check 2/4 FAILED - orders API timeout x{MAX_RETRIES}"]
-        return [f"Check 2/4 FAILED - orders API error ({err}), {elapsed:.2f}s"]
+            return [build_failure(f"Check 2/4 FAILED - orders API timeout x{MAX_RETRIES}", key="orders_timeout")]
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 2/4 FAILED - slow orders response (> {SLA_SECS}s, {elapsed:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="orders_slow",
+                )
+            ]
+        return [build_failure(f"Check 2/4 FAILED - orders API error ({err}), {elapsed:.2f}s", key="orders_error")]
 
     if not isinstance(js, dict):
-        return ["Check 2/4 FAILED - orders bad payload"]
+        return [build_failure("Check 2/4 FAILED - orders bad payload", key="orders_bad_payload")]
     total, active = count_active_orders(js)
-    if active >= 1 and elapsed <= SLA_SECS:
+    if active >= 1:
         print(
             f"✅ Check 2/4 passed - detected {active} active order(s) "
             f"(total returned {total}). Response {elapsed:.2f}s."
         )
         return []
-    return [
-        f"Check 2/4 FAILED - zero active orders (active={active}, total={total}) "
-        f"or slow (> {SLA_SECS}s, {elapsed:.2f}s)"
-    ]
+    return [build_failure(f"Check 2/4 FAILED - zero active orders (active={active}, total={total})", key="orders_zero_active")]
 
 
 def check_preview_single_put():
-    ok, _, quote_payload, _, err = get_quote(HEARTBEAT_SYMBOL)
+    ok, quote_elapsed, quote_payload, _, err = get_quote(HEARTBEAT_SYMBOL)
     if not ok:
         if err == "timeout":
-            return [f"Check 3/4 FAILED - quote timeout x{MAX_RETRIES}"], 0
-        return [f"Check 3/4 FAILED - quote error {err or 'bad payload'}"], 0
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - quote timeout x{MAX_RETRIES}",
+                    category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                    key="quote_timeout",
+                )
+            ], 0
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - slow quote response (> {SLA_SECS}s, {quote_elapsed:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="quote_slow",
+                )
+            ], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - quote error {err or 'bad payload'}",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="quote_error",
+            )
+        ], 0
     if not isinstance(quote_payload, dict):
-        return ["Check 3/4 FAILED - quote bad payload"], 0
+        return [build_failure("Check 3/4 FAILED - quote bad payload", FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN, "quote_bad_payload")], 0
 
     qobj = safe_get(quote_payload, "quotes", "quote")
     if isinstance(qobj, list):
@@ -536,21 +646,59 @@ def check_preview_single_put():
     except Exception:
         under_px = 0.0
     if under_px <= 0:
-        return ["Check 3/4 FAILED - could not derive underlying price"], 0
+        return [
+            build_failure(
+                "Check 3/4 FAILED - could not derive underlying price",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="quote_underlying_price",
+            )
+        ], 0
 
-    ok, _, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
+    ok, exp_elapsed, exps, _, err = get_expirations(HEARTBEAT_SYMBOL)
     if not ok:
         if err == "timeout":
-            return [f"Check 3/4 FAILED - expirations timeout x{MAX_RETRIES}"], 0
-        return [f"Check 3/4 FAILED - expirations error {err or 'bad payload'}"], 0
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - expirations timeout x{MAX_RETRIES}",
+                    category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                    key="expirations_timeout",
+                )
+            ], 0
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - slow expirations response (> {SLA_SECS}s, {exp_elapsed:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="expirations_slow",
+                )
+            ], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - expirations error {err or 'bad payload'}",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="expirations_error",
+            )
+        ], 0
     if not isinstance(exps, dict):
-        return ["Check 3/4 FAILED - expirations bad payload"], 0
+        return [
+            build_failure(
+                "Check 3/4 FAILED - expirations bad payload",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="expirations_bad_payload",
+            )
+        ], 0
 
     raw = safe_get(exps, "expirations", "date", default=[])
     if isinstance(raw, str):
         raw = [raw]
     if not raw:
-        return ["Check 3/4 FAILED - no expirations available"], 0
+        return [
+            build_failure(
+                "Check 3/4 FAILED - no expirations available",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="expirations_none",
+            )
+        ], 0
 
     prefer = date.today().isoformat()
     exp = (
@@ -559,21 +707,68 @@ def check_preview_single_put():
         else (sorted([d for d in raw if d >= prefer])[0] if any(d >= prefer for d in raw) else sorted(raw)[-1])
     )
 
-    ok, _, chain, _, err = get_chain(HEARTBEAT_SYMBOL, exp)
+    ok, chain_elapsed, chain, _, err = get_chain(HEARTBEAT_SYMBOL, exp)
     if not ok:
         if err == "timeout":
-            return [f"Check 3/4 FAILED - chain timeout x{MAX_RETRIES}"], 0
-        return [f"Check 3/4 FAILED - chain error {err or 'bad payload'} for {exp}"], 0
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - chain timeout x{MAX_RETRIES}",
+                    category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                    key="chain_timeout",
+                )
+            ], 0
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - slow chain response (> {SLA_SECS}s, {chain_elapsed:.2f}s) for {exp}",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="chain_slow",
+                )
+            ], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - chain error {err or 'bad payload'} for {exp}",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="chain_error",
+            )
+        ], 0
     if not isinstance(chain, dict):
-        return [f"Check 3/4 FAILED - chain bad payload for {exp}"], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - chain bad payload for {exp}",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="chain_bad_payload",
+            )
+        ], 0
 
     opt_sym, pick_err = pick_atm_put_symbol(chain, under_px)
     if not opt_sym:
-        return [f"Check 3/4 FAILED - {pick_err or 'ATM put selection error'} for {exp}"], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - {pick_err or 'ATM put selection error'} for {exp}",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="chain_option_selection",
+            )
+        ], 0
 
     mid, details = compute_option_mid(opt_sym)
     if mid is None:
-        return [f"Check 3/4 FAILED - cannot compute mid price ({details})"], 0
+        if isinstance(details, str) and details.startswith("slow_response:"):
+            elapsed_txt = details.split(":", 1)[1]
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - slow option quotes response (> {SLA_SECS}s, {elapsed_txt}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="option_quotes_slow",
+                )
+            ], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - cannot compute mid price ({details})",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="option_mid_failure",
+            )
+        ], 0
 
     try:
         print(
@@ -592,16 +787,48 @@ def check_preview_single_put():
     )
     if not ok:
         if err == "timeout":
-            return [f"Check 3/4 FAILED - preview timeout x{MAX_RETRIES}"], 0
-        return [f"Check 3/4 FAILED - preview error {err or 'bad payload'}, {preview_elapsed:.2f}s"], 0
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - preview timeout x{MAX_RETRIES}",
+                    category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                    key="preview_timeout",
+                )
+            ], 0
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 3/4 FAILED - slow preview response (> {SLA_SECS}s, {preview_elapsed:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="preview_slow",
+                )
+            ], 0
+        return [
+            build_failure(
+                f"Check 3/4 FAILED - preview error {err or 'bad payload'}, {preview_elapsed:.2f}s",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="preview_error",
+            )
+        ], 0
 
     if not isinstance(preview_payload, dict):
-        return ["Check 3/4 FAILED - preview bad payload"], 0
+        return [
+            build_failure(
+                "Check 3/4 FAILED - preview bad payload",
+                category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+                key="preview_bad_payload",
+            )
+        ], 0
     status_txt = str(safe_get(preview_payload, "order", "status", default="ok")).lower()
     if "ok" in status_txt:
         print(f"✅ Check 3/4 passed - single-leg ATM PUT preview OK for {exp}. Response {preview_elapsed:.2f}s.")
         return [], preview_elapsed
-    return [f"Check 3/4 FAILED - preview status='{status_txt}' for {exp}, {preview_elapsed:.2f}s"], preview_elapsed
+    return [
+        build_failure(
+            f"Check 3/4 FAILED - preview status='{status_txt}' for {exp}, {preview_elapsed:.2f}s",
+            category=FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN,
+            key="preview_status",
+        )
+    ], preview_elapsed
 
 
 def _extract_total_equity_from_balances_now(js):
@@ -644,14 +871,46 @@ def check_balance_drawdown():
     ok_now, elapsed_now, js_now, _, err_now = get_balances_now()
     if not ok_now:
         if err_now == "timeout":
-            return [f"Check 4/4 FAILED - balances now timeout x{MAX_RETRIES}"]
-        return [f"Check 4/4 FAILED - balances API error ({err_now}), {elapsed_now:.2f}s"]
+            return [
+                build_failure(
+                    f"Check 4/4 FAILED - balances now timeout x{MAX_RETRIES}",
+                    category=FAILURE_CATEGORY_BALANCE_DRAWDOWN,
+                    key="balances_timeout",
+                )
+            ]
+        if err_now == "slow_response":
+            return [
+                build_failure(
+                    f"Check 4/4 FAILED - slow balances response (> {SLA_SECS}s, {elapsed_now:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="balances_slow",
+                )
+            ]
+        return [
+            build_failure(
+                f"Check 4/4 FAILED - balances API error ({err_now}), {elapsed_now:.2f}s",
+                category=FAILURE_CATEGORY_BALANCE_DRAWDOWN,
+                key="balances_error",
+            )
+        ]
     if not isinstance(js_now, dict):
-        return ["Check 4/4 FAILED - balances now bad payload"]
+        return [
+            build_failure(
+                "Check 4/4 FAILED - balances now bad payload",
+                category=FAILURE_CATEGORY_BALANCE_DRAWDOWN,
+                key="balances_bad_payload",
+            )
+        ]
 
     today_equity = _extract_total_equity_from_balances_now(js_now)
     if today_equity is None:
-        return ["Check 4/4 FAILED - could not parse today's total equity from balances payload"]
+        return [
+            build_failure(
+                "Check 4/4 FAILED - could not parse today's total equity from balances payload",
+                category=FAILURE_CATEGORY_BALANCE_DRAWDOWN,
+                key="balances_parse_error",
+            )
+        ]
 
     ok_hist, _, js_hist, _, err_hist = get_historical_balances()
     prev = None
@@ -675,8 +934,12 @@ def check_balance_drawdown():
     drop_pct = (prev - today_equity) / prev * 100.0
     if drop_pct > BALANCE_DD_LIMIT_PCT:
         return [
-            f"Check 4/4 FAILED - equity drop {drop_pct:.2f}% exceeds {BALANCE_DD_LIMIT_PCT:.2f}% "
-            f"(prev={prev:.2f}, today={today_equity:.2f})"
+            build_failure(
+                f"Check 4/4 FAILED - equity drop {drop_pct:.2f}% exceeds {BALANCE_DD_LIMIT_PCT:.2f}% "
+                f"(prev={prev:.2f}, today={today_equity:.2f})",
+                category=FAILURE_CATEGORY_BALANCE_DRAWDOWN,
+                key="balance_drawdown",
+            )
         ]
 
     print(
@@ -690,22 +953,28 @@ def check_balance_drawdown():
 # === Orchestration ===
 def run_checks():
     print(f"\n=== Tradier Heartbeat @ {now()} ===")
-    errs = []
-    check1_errs, _ = check_positions()
-    errs += check1_errs
-    # errs += check_orders()
-    check3_errs, _ = check_preview_single_put()
-    errs += check3_errs
-    errs += check_balance_drawdown()
+    failures = []
+    check1_failures, _ = check_positions()
+    failures += check1_failures
+    # failures += check_orders()
+    check3_failures, _ = check_preview_single_put()
+    failures += check3_failures
+    failures += check_balance_drawdown()
 
-    if errs:
-        print("\n".join(f"❌ {err}" for err in errs))
-        send_alert(
-            context_subject(f"Tradier Heartbeat Failures ({len(errs)}) @ {now()}"),
-            "\n".join(errs),
-        )
-    else:
+    alert_failures = _apply_failure_thresholds(failures)
+
+    if not failures:
         print("✅ All 4 checks passed successfully.\n")
+        return
+
+    print("\n".join(f"❌ {failure['message']}" for failure in failures))
+    if not alert_failures:
+        return
+
+    send_alert(
+        context_subject(f"Tradier Heartbeat Failures ({len(alert_failures)}) @ {now()}"),
+        "\n\n".join(_format_failure_for_alert(failure) for failure in alert_failures),
+    )
 
 
 def run_forever(send_initial_test_alert=True):
@@ -717,7 +986,18 @@ def run_forever(send_initial_test_alert=True):
             run_checks()
         except Exception as exc:
             tb = traceback.format_exc()
-            send_alert(context_subject("Heartbeat Script Crash"), f"{exc}\n{tb}")
+            crash_failure = build_failure(
+                f"Heartbeat Script Crash - {exc}",
+                category=FAILURE_CATEGORY_SCRIPT_CRASH,
+                key="script_crash",
+                details=tb,
+            )
+            alert_failures = _apply_failure_thresholds([crash_failure])
+            if alert_failures:
+                send_alert(
+                    context_subject("Heartbeat Script Crash"),
+                    "\n\n".join(_format_failure_for_alert(failure) for failure in alert_failures),
+                )
             print(tb)
         time.sleep(60)
 
