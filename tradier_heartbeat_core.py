@@ -34,7 +34,7 @@ ORDER_QTY = int(os.getenv("ORDER_QTY", "1"))
 
 # Balance check config
 BALANCE_STORE = os.getenv("BALANCE_STORE", "balance_store.json")
-BALANCE_DD_LIMIT_PCT = float(os.getenv("BALANCE_DD_LIMIT_PCT", "2.5"))  # 2% default
+BALANCE_DD_LIMIT_PCT = float(os.getenv("BALANCE_DD_LIMIT_PCT", "7"))  # 2% default
 
 # Email + alert
 SMTP_HOST = os.getenv("SMTP_HOST")
