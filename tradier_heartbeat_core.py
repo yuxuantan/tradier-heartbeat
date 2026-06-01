@@ -71,6 +71,7 @@ MAX_PRINT_CHARS = 50
 _CAFFEINATE_PROC = None
 RUN_CONTEXT = "Unknown"
 _CONSECUTIVE_FAILURE_COUNTS = {}
+SPX_PRICE_RANGE = None
 
 
 def now():
@@ -120,6 +121,45 @@ def configure_runtime(enable_sound_alert=False, keep_awake=False, max_print_char
 
 
 atexit.register(_stop_keep_awake)
+
+
+def configure_spx_price_range(low, high):
+    global SPX_PRICE_RANGE
+    low = float(low)
+    high = float(high)
+    if low <= 0 or high <= 0:
+        raise ValueError("SPX range bounds must be positive numbers.")
+    if low > high:
+        raise ValueError("SPX range low cannot be greater than high.")
+    SPX_PRICE_RANGE = (low, high)
+
+
+def _prompt_positive_float(prompt):
+    while True:
+        raw = input(prompt).strip().replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Please enter a valid number.")
+            continue
+        if value <= 0:
+            print("Please enter a positive number.")
+            continue
+        return value
+
+
+def prompt_spx_price_range():
+    while True:
+        print(f"\nConfigure allowed {HEARTBEAT_SYMBOL} price range for this heartbeat run.")
+        low = _prompt_positive_float(f"{HEARTBEAT_SYMBOL} range low: ")
+        high = _prompt_positive_float(f"{HEARTBEAT_SYMBOL} range high: ")
+        try:
+            configure_spx_price_range(low, high)
+        except ValueError as exc:
+            print(f"{exc} Please enter the range again.")
+            continue
+        print(f"[{now()}] {HEARTBEAT_SYMBOL} range check enabled: {low:.2f} to {high:.2f}.")
+        return
 
 
 # === Alerting ===
@@ -457,6 +497,28 @@ def safe_get(dct, *path, default=None):
     return cur
 
 
+def _extract_quote_object(quote_payload):
+    qobj = safe_get(quote_payload, "quotes", "quote")
+    if isinstance(qobj, list):
+        return qobj[0] if qobj else {}
+    return qobj if isinstance(qobj, dict) else {}
+
+
+def _extract_underlying_price_from_quote(quote_payload):
+    qobj = _extract_quote_object(quote_payload)
+    for field in ("last", "close", "bid", "ask"):
+        try:
+            value = qobj.get(field)
+            if value is None:
+                continue
+            price = float(value)
+            if price > 0:
+                return price
+        except Exception:
+            continue
+    return None
+
+
 ACTIVE_STATUSES = {"open", "pending", "live", "accepted", "partially_filled"}
 
 
@@ -557,6 +619,63 @@ def _load_and_update_local_balance_store(today_equity):
 
 
 # === Checks ===
+def check_spx_price_range():
+    if SPX_PRICE_RANGE is None:
+        return []
+
+    low, high = SPX_PRICE_RANGE
+    ok, elapsed, quote_payload, _, err = get_quote(HEARTBEAT_SYMBOL)
+    if not ok:
+        if err == "timeout":
+            return [
+                build_failure(
+                    f"Check 2/4 FAILED - {HEARTBEAT_SYMBOL} quote timeout x{MAX_RETRIES}",
+                    key="spx_price_range_quote_timeout",
+                )
+            ]
+        if err == "slow_response":
+            return [
+                build_failure(
+                    f"Check 2/4 FAILED - slow {HEARTBEAT_SYMBOL} quote response (> {SLA_SECS}s, {elapsed:.2f}s)",
+                    category=FAILURE_CATEGORY_SLOW_RESPONSE,
+                    key="spx_price_range_quote_slow",
+                )
+            ]
+        return [
+            build_failure(
+                f"Check 2/4 FAILED - {HEARTBEAT_SYMBOL} quote error {err or 'bad payload'}",
+                key="spx_price_range_quote_error",
+            )
+        ]
+
+    if not isinstance(quote_payload, dict):
+        return [build_failure(f"Check 2/4 FAILED - {HEARTBEAT_SYMBOL} quote bad payload", key="spx_price_range_bad_payload")]
+
+    current_price = _extract_underlying_price_from_quote(quote_payload)
+    if current_price is None:
+        return [
+            build_failure(
+                f"Check 2/4 FAILED - could not derive {HEARTBEAT_SYMBOL} current price",
+                key="spx_price_range_no_price",
+            )
+        ]
+
+    if current_price < low or current_price > high:
+        return [
+            build_failure(
+                f"Check 2/4 FAILED - {HEARTBEAT_SYMBOL} price {current_price:.2f} outside range "
+                f"{low:.2f}-{high:.2f}",
+                key="spx_price_out_of_range",
+            )
+        ]
+
+    print(
+        f"✅ Check 2/4 passed - {HEARTBEAT_SYMBOL} price {current_price:.2f} within range "
+        f"{low:.2f}-{high:.2f}. Response {elapsed:.2f}s."
+    )
+    return []
+
+
 def check_positions():
     ok, elapsed, js, _, err = get_positions()
     if not ok:
@@ -638,14 +757,8 @@ def check_preview_single_put():
     if not isinstance(quote_payload, dict):
         return [build_failure("Check 3/4 FAILED - quote bad payload", FAILURE_CATEGORY_QUOTE_PREVIEW_CHAIN, "quote_bad_payload")], 0
 
-    qobj = safe_get(quote_payload, "quotes", "quote")
-    if isinstance(qobj, list):
-        qobj = qobj[0] if qobj else {}
-    try:
-        under_px = float(qobj.get("last") or qobj.get("close") or qobj.get("bid") or 0)
-    except Exception:
-        under_px = 0.0
-    if under_px <= 0:
+    under_px = _extract_underlying_price_from_quote(quote_payload)
+    if under_px is None:
         return [
             build_failure(
                 "Check 3/4 FAILED - could not derive underlying price",
@@ -957,6 +1070,7 @@ def run_checks():
     check1_failures, _ = check_positions()
     failures += check1_failures
     # failures += check_orders()
+    failures += check_spx_price_range()
     check3_failures, _ = check_preview_single_put()
     failures += check3_failures
     failures += check_balance_drawdown()
@@ -1008,6 +1122,7 @@ def run(
     max_print_chars_default=50,
     send_initial_test_alert=True,
     run_context=None,
+    prompt_spx_range=False,
 ):
     configure_runtime(
         enable_sound_alert=enable_sound_alert,
@@ -1015,6 +1130,8 @@ def run(
         max_print_chars_default=max_print_chars_default,
         run_context=run_context,
     )
+    if prompt_spx_range:
+        prompt_spx_price_range()
     run_forever(send_initial_test_alert=send_initial_test_alert)
 
 

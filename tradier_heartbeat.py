@@ -11,4 +11,5 @@ if __name__ == "__main__":
         max_print_chars_default=100,
         send_initial_test_alert=True,
         run_context="Local PC",
+        prompt_spx_range=True,
     )
