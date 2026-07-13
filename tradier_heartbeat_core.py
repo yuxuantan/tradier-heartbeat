@@ -44,6 +44,15 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
+# Pushover emergency alerts (email remains an independent backup channel)
+PUSHOVER_APP_TOKEN = os.getenv("PUSHOVER_APP_TOKEN")
+PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY")
+PUSHOVER_DEVICE = os.getenv("PUSHOVER_DEVICE")
+PUSHOVER_SOUND = os.getenv("PUSHOVER_SOUND")
+PUSHOVER_RETRY_SECS = int(os.getenv("PUSHOVER_RETRY_SECS", "60"))
+PUSHOVER_EXPIRE_SECS = int(os.getenv("PUSHOVER_EXPIRE_SECS", "3600"))
+PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
+
 # HTTP
 HEADERS = {"Authorization": f"Bearer {TRADIER_ACCESS_TOKEN}", "Accept": "application/json"}
 REQ_TIMEOUT = 10  # per request timeout seconds
@@ -261,6 +270,53 @@ def alert_with_rising_volume():
     print("🛑 Alert stopped by user.")
 
 
+def send_pushover_alert(subject, body):
+    """Send one acknowledgement-required Pushover emergency notification."""
+    if not (PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY):
+        print(f"[{now()}] ⚠️ Pushover not sent (PUSHOVER_APP_TOKEN/PUSHOVER_USER_KEY missing)")
+        return None
+    if PUSHOVER_RETRY_SECS < 30:
+        print(f"[{now()}] ❌ Pushover not sent (PUSHOVER_RETRY_SECS must be at least 30)")
+        return None
+    if not 1 <= PUSHOVER_EXPIRE_SECS <= 10800:
+        print(f"[{now()}] ❌ Pushover not sent (PUSHOVER_EXPIRE_SECS must be between 1 and 10800)")
+        return None
+
+    payload = {
+        "token": PUSHOVER_APP_TOKEN,
+        "user": PUSHOVER_USER_KEY,
+        "title": str(subject)[:250],
+        "message": (str(body).strip() or str(subject))[:1024],
+        "priority": "2",
+        "retry": str(PUSHOVER_RETRY_SECS),
+        "expire": str(PUSHOVER_EXPIRE_SECS),
+    }
+    if PUSHOVER_DEVICE:
+        payload["device"] = PUSHOVER_DEVICE
+    if PUSHOVER_SOUND:
+        payload["sound"] = PUSHOVER_SOUND
+
+    try:
+        response = requests.post(PUSHOVER_API_URL, data=payload, timeout=15)
+        try:
+            response_payload = response.json()
+        except Exception:
+            response_payload = {}
+        if not response.ok or response_payload.get("status") != 1:
+            errors = response_payload.get("errors") or f"HTTP {response.status_code}"
+            print(f"[{now()}] ❌ Pushover send failed: {errors}")
+            return None
+        receipt = response_payload.get("receipt")
+        if not receipt:
+            print(f"[{now()}] ❌ Pushover send failed: emergency receipt missing")
+            return None
+        print(f"[{now()}] 📲 Pushover emergency sent; acknowledgement receipt={receipt}")
+        return receipt
+    except Exception as exc:
+        print(f"[{now()}] ❌ Pushover send failed: {exc}")
+        return None
+
+
 def send_alert(subject, body):
     if not (SMTP_HOST and SMTP_PORT and EMAIL_FROM and EMAIL_TO):
         print(f"[{now()}] ⚠️ Email not sent (SMTP vars missing)\n{body}")
@@ -277,6 +333,7 @@ def send_alert(subject, body):
         except Exception as exc:
             print(f"[{now()}] ❌ Email send failed: {exc}")
 
+    send_pushover_alert(subject, body)
     alert_with_rising_volume()
 
 

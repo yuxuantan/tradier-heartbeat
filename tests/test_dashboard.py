@@ -68,6 +68,48 @@ class CoreResultTests(unittest.TestCase):
         self.assertEqual(price_check["status"], "skipped")
 
 
+class AlertDeliveryTests(unittest.TestCase):
+    def test_pushover_uses_emergency_priority_and_returns_receipt(self):
+        response = mock.Mock(ok=True, status_code=200)
+        response.json.return_value = {"status": 1, "receipt": "receipt-123"}
+        with mock.patch.multiple(
+            core,
+            PUSHOVER_APP_TOKEN="app-token",
+            PUSHOVER_USER_KEY="user-key",
+            PUSHOVER_DEVICE=None,
+            PUSHOVER_SOUND=None,
+            PUSHOVER_RETRY_SECS=60,
+            PUSHOVER_EXPIRE_SECS=3600,
+        ), mock.patch.object(core.requests, "post", return_value=response) as post_mock:
+            receipt = core.send_pushover_alert("Heartbeat failed", "SPX quote unavailable")
+
+        self.assertEqual(receipt, "receipt-123")
+        payload = post_mock.call_args.kwargs["data"]
+        self.assertEqual(payload["priority"], "2")
+        self.assertEqual(payload["retry"], "60")
+        self.assertEqual(payload["expire"], "3600")
+        self.assertEqual(payload["message"], "SPX quote unavailable")
+
+    def test_send_alert_keeps_email_and_also_calls_pushover(self):
+        with mock.patch.multiple(
+            core,
+            SMTP_HOST="smtp.example.com",
+            SMTP_PORT=587,
+            SMTP_USER="smtp-user",
+            SMTP_PASS="smtp-pass",
+            EMAIL_FROM="from@example.com",
+            EMAIL_TO="to@example.com",
+        ), mock.patch.object(core.smtplib, "SMTP") as smtp_mock, \
+             mock.patch.object(core, "send_pushover_alert") as pushover_mock, \
+             mock.patch.object(core, "alert_with_rising_volume") as sound_mock:
+            core.send_alert("Heartbeat failed", "Failure details")
+
+        smtp_connection = smtp_mock.return_value.__enter__.return_value
+        smtp_connection.sendmail.assert_called_once()
+        pushover_mock.assert_called_once_with("Heartbeat failed", "Failure details")
+        sound_mock.assert_called_once()
+
+
 class ControllerTests(unittest.TestCase):
     def test_controller_runs_immediately_and_records_result(self):
         completed = threading.Event()

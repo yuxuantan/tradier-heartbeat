@@ -405,6 +405,8 @@ function renderSettings(data, forceFormSync = false) {
   $("#credentialsDot").classList.toggle("ready", config.credentials_configured);
   $("#emailState").textContent = config.email_configured ? "Ready" : "Not configured";
   $("#emailDot").classList.toggle("ready", config.email_configured);
+  $("#pushoverState").textContent = config.pushover_configured ? "Ready" : "Not configured";
+  $("#pushoverDot").classList.toggle("ready", config.pushover_configured);
   $("#footerMeta").textContent = `${config.symbol} · ${config.interval_seconds}s cadence · ${config.sla_seconds}s SLA`;
 }
 

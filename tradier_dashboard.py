@@ -292,6 +292,7 @@ class HeartbeatController:
                     "price_range_high": price_range[1] if price_range else None,
                     "credentials_configured": bool(heartbeat.TRADIER_ACCESS_TOKEN and heartbeat.ACCOUNT_ID),
                     "email_configured": bool(heartbeat.SMTP_HOST and heartbeat.EMAIL_FROM and heartbeat.EMAIL_TO),
+                    "pushover_configured": bool(heartbeat.PUSHOVER_APP_TOKEN and heartbeat.PUSHOVER_USER_KEY),
                 },
                 "last_result": self.last_result,
                 "history": list(self.history),
