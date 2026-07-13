@@ -134,6 +134,11 @@ def configure_spx_price_range(low, high):
     SPX_PRICE_RANGE = (low, high)
 
 
+def clear_spx_price_range():
+    global SPX_PRICE_RANGE
+    SPX_PRICE_RANGE = None
+
+
 def _prompt_positive_float(prompt):
     while True:
         raw = input(prompt).strip().replace(",", "")
@@ -1065,30 +1070,74 @@ def check_balance_drawdown():
 
 # === Orchestration ===
 def run_checks():
+    started_at = datetime.now().astimezone()
+    started_monotonic = time.monotonic()
     print(f"\n=== Tradier Heartbeat @ {now()} ===")
     failures = []
     check1_failures, _ = check_positions()
     failures += check1_failures
     # failures += check_orders()
-    failures += check_spx_price_range()
+    price_range_failures = check_spx_price_range()
+    failures += price_range_failures
     check3_failures, _ = check_preview_single_put()
     failures += check3_failures
-    failures += check_balance_drawdown()
+    balance_failures = check_balance_drawdown()
+    failures += balance_failures
 
     alert_failures = _apply_failure_thresholds(failures)
 
+    checks = [
+        {
+            "id": "positions",
+            "label": "Positions API",
+            "status": "failed" if check1_failures else "passed",
+            "failures": check1_failures,
+        },
+        {
+            "id": "price_range",
+            "label": f"{HEARTBEAT_SYMBOL} Price Guard",
+            "status": "skipped" if SPX_PRICE_RANGE is None else ("failed" if price_range_failures else "passed"),
+            "failures": price_range_failures,
+        },
+        {
+            "id": "option_preview",
+            "label": "Option Order Preview",
+            "status": "failed" if check3_failures else "passed",
+            "failures": check3_failures,
+        },
+        {
+            "id": "balance_drawdown",
+            "label": "Balance Drawdown",
+            "status": "failed" if balance_failures else "passed",
+            "failures": balance_failures,
+        },
+    ]
+
+    def build_result():
+        finished_at = datetime.now().astimezone()
+        return {
+            "status": "healthy" if not failures else "degraded",
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round(time.monotonic() - started_monotonic, 3),
+            "checks": checks,
+            "failures": failures,
+            "alert_failures": alert_failures,
+        }
+
     if not failures:
         print("✅ All 4 checks passed successfully.\n")
-        return
+        return build_result()
 
     print("\n".join(f"❌ {failure['message']}" for failure in failures))
     if not alert_failures:
-        return
+        return build_result()
 
     send_alert(
         context_subject(f"Tradier Heartbeat Failures ({len(alert_failures)}) @ {now()}"),
         "\n\n".join(_format_failure_for_alert(failure) for failure in alert_failures),
     )
+    return build_result()
 
 
 def run_forever(send_initial_test_alert=True):

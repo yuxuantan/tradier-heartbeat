@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#071c19">
+    <title>Tradier Heartbeat</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Tradier Heartbeat home">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="brand-pulse"></span>
+          <svg viewBox="0 0 32 32" role="img"><path d="M3 17h6l3-8 5 15 4-11 3 4h5"/></svg>
+        </span>
+        <span>
+          <strong>Tradier</strong>
+          <small>Heartbeat</small>
+        </span>
+      </a>
+
+      <div class="topbar-actions">
+        <div class="connection-pill"><span></span>Local connection</div>
+        <button class="icon-button" id="soundButton" type="button" aria-label="Toggle browser alert sound" title="Browser alert sound">
+          <svg class="sound-on" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5Zm4.5 3.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12"/></svg>
+          <svg class="sound-off" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5Zm5 5 5 5m0-5-5 5"/></svg>
+        </button>
+        <button class="icon-button" id="settingsButton" type="button" aria-label="Open settings" title="Settings">
+          <svg viewBox="0 0 24 24"><path d="M12 15.25A3.25 3.25 0 1 0 12 8.75a3.25 3.25 0 0 0 0 6.5Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.55V21h-4v-.08A1.7 1.7 0 0 0 8.95 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.58 15 1.7 1.7 0 0 0 3 14H3v-4h.08A1.7 1.7 0 0 0 4.6 8.95a1.7 1.7 0 0 0-.34-1.88L4.2 7l2.83-2.83.06.06a1.7 1.7 0 0 0 1.88.34A1.7 1.7 0 0 0 10 3.05V3h4v.08a1.7 1.7 0 0 0 1.05 1.52 1.7 1.7 0 0 0 1.88-.34l.06-.06L19.82 7l-.06.06a1.7 1.7 0 0 0-.34 1.88A1.7 1.7 0 0 0 20.95 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="eyebrow"><span id="heroDot"></span><span id="heroEyebrow">Connecting to monitor</span></div>
+        <div class="hero-copy">
+          <div>
+            <h1 id="heroTitle">Heartbeat is starting</h1>
+            <p id="heroDescription">The first Tradier health check will begin in a moment.</p>
+          </div>
+          <div class="hero-controls">
+            <button class="button button-danger hidden" id="acknowledgeButton" type="button">
+              <svg viewBox="0 0 24 24"><path d="M12 3 2.8 19h18.4L12 3Z"/><path d="M12 9v4m0 3h.01"/></svg>
+              Acknowledge alarm
+            </button>
+            <button class="button button-secondary" id="monitoringButton" type="button">Pause monitor</button>
+            <button class="button button-primary" id="runButton" type="button">
+              <svg viewBox="0 0 24 24"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.64 5.64l2.12 2.12m8.48 8.48 2.12 2.12m0-12.72-2.12 2.12M7.76 16.24l-2.12 2.12"/></svg>
+              Run check now
+            </button>
+          </div>
+        </div>
+        <div class="vitals">
+          <article>
+            <span class="vital-icon green"><svg viewBox="0 0 24 24"><path d="M4 13h3l2-6 4 12 3-8 2 2h2"/></svg></span>
+            <div><small>Monitor state</small><strong id="monitorState">Starting</strong></div>
+          </article>
+          <article>
+            <span class="vital-icon blue"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg></span>
+            <div><small>Last cycle</small><strong id="lastCycle">—</strong></div>
+          </article>
+          <article>
+            <span class="vital-icon amber"><svg viewBox="0 0 24 24"><path d="M4 19V8m5 11V5m5 14v-7m5 7V3"/></svg></span>
+            <div><small>Response time</small><strong id="responseTime">—</strong></div>
+          </article>
+          <article>
+            <span class="vital-icon purple"><svg viewBox="0 0 24 24"><path d="M7 3h10v4l-2 3 2 3v4H7v-4l2-3-2-3V3Z"/><path d="M5 21h14"/></svg></span>
+            <div><small>Next check</small><strong id="nextCheck">—</strong></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section checks-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Live diagnostics</span><h2>System checks</h2></div>
+          <div class="summary-chip" id="checksSummary">Waiting for first cycle</div>
+        </div>
+        <div class="check-grid" id="checkGrid">
+          <article class="check-card skeleton"></article>
+          <article class="check-card skeleton"></article>
+          <article class="check-card skeleton"></article>
+          <article class="check-card skeleton"></article>
+        </div>
+      </section>
+
+      <section class="section data-grid">
+        <article class="panel balance-panel">
+          <div class="panel-heading">
+            <div><span class="section-kicker">Account telemetry</span><h2>Balance history</h2></div>
+            <span class="range-badge">Past 30 days</span>
+          </div>
+          <div class="balance-metrics">
+            <div><small>Latest equity</small><strong id="latestEquity">—</strong></div>
+            <div><small>Past-day change</small><strong id="periodChange">—</strong></div>
+          </div>
+          <div class="chart-wrap" id="balanceChart" aria-label="Balance history chart">
+            <div class="chart-empty">Balance data will appear after a successful balance check.</div>
+          </div>
+        </article>
+
+        <article class="panel activity-panel">
+          <div class="panel-heading">
+            <div><span class="section-kicker">Audit trail</span><h2>Recent activity</h2></div>
+            <span class="range-badge" id="runCount">0 runs</span>
+          </div>
+          <div class="activity-list" id="activityList">
+            <div class="activity-empty">No heartbeat cycles recorded yet.</div>
+          </div>
+        </article>
+      </section>
+
+      <footer>
+        <span><i></i> Served locally on this machine</span>
+        <span id="footerMeta">Tradier Heartbeat</span>
+      </footer>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <dialog id="settingsDialog">
+      <form method="dialog" id="settingsForm">
+        <div class="dialog-heading">
+          <div><span class="section-kicker">Monitor settings</span><h2>Heartbeat controls</h2></div>
+          <button class="icon-button" value="cancel" aria-label="Close settings" type="submit">
+            <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
+        <label class="field">
+          <span>Check interval <small>15–3600 seconds</small></span>
+          <input id="intervalInput" name="interval" type="number" min="15" max="3600" required>
+        </label>
+        <label class="switch-row">
+          <span><strong>SPX price guard</strong><small>Flag quotes outside an expected range</small></span>
+          <input id="priceRangeEnabled" type="checkbox">
+          <i></i>
+        </label>
+        <div class="range-fields" id="rangeFields">
+          <label class="field"><span>Range low</span><input id="rangeLowInput" type="number" step="0.01" min="0"></label>
+          <label class="field"><span>Range high</span><input id="rangeHighInput" type="number" step="0.01" min="0"></label>
+        </div>
+        <div class="config-facts">
+          <span><i id="credentialsDot"></i>Tradier credentials <strong id="credentialsState">—</strong></span>
+          <span><i id="emailDot"></i>Email alerts <strong id="emailState">—</strong></span>
+        </div>
+        <div class="dialog-actions">
+          <button class="button button-secondary" value="cancel" type="submit">Cancel</button>
+          <button class="button button-primary" id="saveSettingsButton" value="default" type="submit">Save settings</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
